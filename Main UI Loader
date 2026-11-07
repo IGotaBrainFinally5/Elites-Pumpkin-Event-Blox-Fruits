@@ -1,11 +1,11 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — v8
--- Nearest-target fix + instant retarget + Gacha Timer + Fruit History & Statistics tab
--- + Candy Corn tracking + Pumpkins-farmed counter + ToT candy counter + NPC diagnostics
--- + X-close now stops all features cleanly
--- Preserves v7 GUI theme, layout, movement interpolation, water-safe clamp, stuck recovery, weapon select.
+-- ELITES HALLOWEEN FARM — v9
+-- Fixes: fruit history reads only gacha rolls; centered stats layout;
+-- real in-game gacha timer via GUI text; no bunny hopping; water check removed.
+-- Preserves: GUI theme, layout, fly movement, noclip, water clamp, stuck recovery,
+-- weapon select, X-close stops all.
 
-print("[EHF] v8 starting...")
+print("[EHF] v9 starting...")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -16,14 +16,9 @@ local CoreGui = game:GetService("CoreGui")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
-if not player then
-    warn("[EHF] LocalPlayer unavailable.")
-    return
-end
+if not player then warn("[EHF] LocalPlayer unavailable."); return end
 
--- =========================================================
 -- PURGE / PARENT
--- =========================================================
 local function purgeAll()
     local parents = {}
     local okPg, pg = pcall(function() return player:FindFirstChild("PlayerGui") end)
@@ -34,10 +29,7 @@ local function purgeAll()
     if okHui and hui then table.insert(parents, hui) end
     for _, p in ipairs(parents) do
         local old = p:FindFirstChild("ElitesHalloweenFarm")
-        if old then
-            old:Destroy()
-            warn("[EHF] Purged stale ElitesHalloweenFarm from " .. tostring(p))
-        end
+        if old then old:Destroy(); warn("[EHF] Purged stale GUI.") end
     end
 end
 purgeAll()
@@ -46,32 +38,17 @@ local function resolveGuiParent()
     local okPg, pg = pcall(function()
         return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5)
     end)
-    if okPg and pg then
-        warn("[EHF] Using PlayerGui as GUI parent.")
-        return pg
-    end
+    if okPg and pg then warn("[EHF] Using PlayerGui."); return pg end
     local okCg, cg = pcall(function() return CoreGui end)
-    if okCg and cg then
-        warn("[EHF] Using CoreGui as GUI parent.")
-        return cg
-    end
+    if okCg and cg then warn("[EHF] Using CoreGui."); return cg end
     local okHui, hui = pcall(function() return gethui and gethui() end)
-    if okHui and hui then
-        warn("[EHF] Using gethui() as GUI parent (fallback).")
-        return hui
-    end
+    if okHui and hui then warn("[EHF] Using gethui()."); return hui end
     return nil
 end
-
 local guiParent = resolveGuiParent()
-if not guiParent then
-    warn("[EHF] Could not resolve any GUI parent.")
-    return
-end
+if not guiParent then warn("[EHF] No GUI parent."); return end
 
--- =========================================================
 -- CONFIG
--- =========================================================
 local CONFIG = {
     GACHA_BOX = "Halloween26Gacha",
     PUMPKIN_RESPAWN = 690,
@@ -79,23 +56,25 @@ local CONFIG = {
     FEATURE_TICK = 1,
     EVENT_SCAN_INTERVAL = 10,
     ATTACK_COOLDOWN = 0.35,
-    TOUCH_DISTANCE = 8,
+    TOUCH_DISTANCE = 10,
     FLY_SPEED_DEFAULT = 250,
     FLY_SPEED_MIN = 50,
     FLY_SPEED_MAX = 400,
+    FLY_HOVER_HEIGHT = 5,
     MIN_HEIGHT_ABOVE_WATER = 6,
-    WATER_CHECK_INTERVAL = 0.5,
     STUCK_TIMEOUT = 3.0,
     OSCILLATION_THRESHOLD = 8,
     BLACKLIST_DURATION = 30,
     PROGRESS_THRESHOLD = 0.5,
     STUCK_TICK_DT = 0.1,
-    SWITCH_MIN_DIST = 15,        -- only consider switching during MOVING if dist > this
-    SWITCH_MARGIN = 15,          -- new target must be this much closer
-    ATTACK_TIMEOUT = 15,         -- if ATTACKING this long without pumpkin disappearing, blacklist
-    TARGET_DIST_LOG_INTERVAL = 5,-- throttle "current target" diagnostic logs
+    SWITCH_MIN_DIST = 15,
+    SWITCH_MARGIN = 15,
+    ATTACK_TIMEOUT = 15,
+    TARGET_DIST_LOG_INTERVAL = 5,
+    ROLL_WINDOW_SECONDS = 60,
     NPC_SCAN_RADIUS = 60,
     NPC_SCAN_INTERVAL = 3,
+    GACHA_TIMER_SCAN_INTERVAL = 5,
 }
 
 local THEME = {
@@ -116,88 +95,56 @@ local THEME = {
 local FONT_REG = Enum.Font.Arial
 local FONT_BOLD = Enum.Font.ArialBold
 do
-    local ok1 = pcall(function() local f = Enum.Font.SourceSans; assert(f ~= nil) end)
-    if ok1 then
+    local ok = pcall(function() local f = Enum.Font.SourceSans; assert(f ~= nil) end)
+    if ok then
         FONT_REG = Enum.Font.SourceSans
         FONT_BOLD = Enum.Font.SourceSansBold
     end
 end
 
--- =========================================================
 -- STATE
--- =========================================================
 local pumpkinFarm = {
-    running = false,
-    thread = nil,
-    state = "IDLE",
-    currentPumpkin = nil,
-    currentRoot = nil,
-    flyTarget = nil,
-    speed = CONFIG.FLY_SPEED_DEFAULT,
-    weaponCategory = "Melee",
-    lastAttackTime = 0,
-    lastRespawnAt = nil,
-    lastHumanoid = nil,
-    lastWaterCheck = 0,
-    stuckTime = 0,
-    lastDistance = nil,
-    lastY = nil,
-    lastDy = nil,
-    oscillationCount = 0,
-    attackStartedAt = nil,
-    blacklist = {},
-    weaponEquippedFor = nil,
-    lastDistLog = 0,
-    lastSelectedDistance = nil,
-    lastKillTime = nil,
+    running = false, thread = nil, state = "IDLE",
+    currentPumpkin = nil, currentRoot = nil, flyTarget = nil,
+    speed = CONFIG.FLY_SPEED_DEFAULT, weaponCategory = "Melee",
+    lastAttackTime = 0, lastRespawnAt = nil, lastHumanoid = nil,
+    stuckTime = 0, lastDistance = nil, lastY = nil, lastDy = nil, oscillationCount = 0,
+    attackStartedAt = nil, blacklist = {}, weaponEquippedFor = nil,
+    lastDistLog = 0, lastKillTime = nil,
 }
-
 local noclipParts = {}
 
--- Statistics
 local stats = {
-    pumpkinsFarmed = 0,
-    totCandyCorn = 0,
-    lastCandyCorn = nil,
-    currentCandyCorn = nil,
-    candyCornSource = nil,
-    lastCheck = 0,
+    pumpkinsFarmed = 0, totCandyCorn = 0,
+    lastCandyCorn = nil, currentCandyCorn = nil, candyCornSource = nil,
 }
 
--- Fruit history: [name] = { count, status, lastSeen }
 local fruitHistory = {}
 local observedFruitTools = {}
+local fruitSeeded = false
+local fruitDirty = true
 
--- Gacha timer
 local gacha = {
     lastPurchaseAttemptAt = nil,
     lastConfirmedRollAt = nil,
-    cooldownSeconds = nil,       -- nil = unknown
-    lastResponseShape = nil,
+    pendingRollWindowUntil = nil,
+    cooldownSeconds = nil,
 }
+local gachaTimerSource = nil
+local gachaLastFullScan = 0
 
--- Store-hook state
 local lastStoreAttempt = nil
 local storeHookActive = false
-
--- Death tracking
 local recentDeathAt = nil
-
--- Trick-or-Treat interaction timestamp for candy attribution
 local lastTotInteractionAt = nil
-
--- NPC threat detection state
 local npcLastScan = 0
 
--- =========================================================
 -- LOGGING
--- =========================================================
 local function timestamp()
     local ok, res = pcall(function() return os.date("%H:%M:%S") end)
     if ok and res then return res end
     return string.format("%.1f", os.clock())
 end
-
 local function fmt(v)
     if type(v) == "table" then
         local ok, res = pcall(function() return HttpService:JSONEncode(v) end)
@@ -208,41 +155,34 @@ end
 
 local logEnabled = true
 local logLines = {}
-local logLabel
-local logScroll
-local summaryStatus
+local logLabel, logScroll, summaryStatus
 local updateSummary
 
 local function addLog(tag, msg)
     if not logEnabled and tag ~= "SYS" and tag ~= "ERROR" then return end
     local line = string.format("%s [%s] %s", timestamp(), tostring(tag), tostring(msg))
     table.insert(logLines, line)
-    while #logLines > CONFIG.MAX_LOG_LINES do
-        table.remove(logLines, 1)
-    end
+    while #logLines > CONFIG.MAX_LOG_LINES do table.remove(logLines, 1) end
     if logLabel then
         logLabel.Text = table.concat(logLines, "\n")
         if logScroll then
-            local bounds = 0
-            local ok, b = pcall(function() return logLabel.TextBounds.Y end)
-            if ok and type(b) == "number" and b > 0 then bounds = b else bounds = #logLines * 16 end
-            logScroll.CanvasSize = UDim2.new(0, 0, 0, math.max(bounds + 16, 32))
+            local b = 0
+            local ok, v = pcall(function() return logLabel.TextBounds.Y end)
+            if ok and type(v) == "number" and v > 0 then b = v else b = #logLines * 16 end
+            logScroll.CanvasSize = UDim2.new(0, 0, 0, math.max(b + 16, 32))
         end
     end
     if updateSummary then updateSummary() end
 end
 
--- =========================================================
 -- UI HELPERS
--- =========================================================
-local function applyCorner(frame, radius)
+local function applyCorner(f, r)
     pcall(function()
         local c = Instance.new("UICorner")
-        c.CornerRadius = UDim2.fromOffset(radius, radius)
-        c.Parent = frame
+        c.CornerRadius = UDim2.fromOffset(r, r)
+        c.Parent = f
     end)
 end
-
 local function makeFrame(parent, color, size, pos, name)
     local f = Instance.new("Frame")
     if name then f.Name = name end
@@ -257,7 +197,6 @@ local function makeFrame(parent, color, size, pos, name)
     applyCorner(f, 8)
     return f
 end
-
 local function makeLabel(parent, text, size, pos, textSize, color, bold)
     local l = Instance.new("TextLabel")
     l.BackgroundTransparency = 1
@@ -274,7 +213,6 @@ local function makeLabel(parent, text, size, pos, textSize, color, bold)
     l.Parent = parent
     return l
 end
-
 local function makeButton(parent, text, size, pos)
     local b = Instance.new("TextButton")
     b.Text = text
@@ -294,27 +232,17 @@ local function makeButton(parent, text, size, pos)
     return b
 end
 
--- Forward declarations
-local refreshStatsTab
-local refreshFruitList
-local updateCountdownLabels
-local readCandyCorn
-local checkCandyCornChange
+-- Forward
+local refreshStatsTab, refreshFruitList, updateCountdownLabels, readCandyCorn, checkCandyCornChange, seedExistingFruits
 
--- =========================================================
--- STORE HOOK (observe StoreFruit calls to confirm storage)
--- =========================================================
+-- STORE HOOK
 local function tryHookStore()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then return false end
-
     local okHook = false
-    -- Preferred: hookmetamethod
     pcall(function()
-        if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-            error("no hookmetamethod")
-        end
+        if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then error("no") end
         local old
         old = hookmetamethod(game, "__namecall", function(self, ...)
             local method = getnamecallmethod()
@@ -329,21 +257,10 @@ local function tryHookStore()
         end)
         okHook = true
     end)
-
-    if okHook then
-        storeHookActive = true
-        warn("[EHF] Store hook active (hookmetamethod).")
-        return true
-    end
-
-    -- Fallback: raw metatable
+    if okHook then storeHookActive = true; warn("[EHF] Store hook active."); return true end
     pcall(function()
-        if type(getrawmetatable) ~= "function" or type(setreadonly) ~= "function" then
-            error("no raw mt")
-        end
-        if type(newcclosure) ~= "function" or type(getnamecallmethod) ~= "function" then
-            error("no namecall introspection")
-        end
+        if type(getrawmetatable) ~= "function" or type(setreadonly) ~= "function" then error("no") end
+        if type(newcclosure) ~= "function" or type(getnamecallmethod) ~= "function" then error("no") end
         local mt = getrawmetatable(game)
         local old = mt.__namecall
         setreadonly(mt, false)
@@ -361,22 +278,13 @@ local function tryHookStore()
         setreadonly(mt, true)
         okHook = true
     end)
-
-    if okHook then
-        storeHookActive = true
-        warn("[EHF] Store hook active (raw metatable).")
-        return true
-    end
-
-    warn("[EHF] Store hook unavailable on this executor; storage detection will be inference-only.")
+    if okHook then storeHookActive = true; warn("[EHF] Store hook active (raw)."); return true end
+    warn("[EHF] Store hook unavailable; storage is inferred.")
     return false
 end
-
 tryHookStore()
 
--- =========================================================
--- DEATH DETECTION (for fruit loss inference)
--- =========================================================
+-- DEATH DETECTION
 local function bindHumanoid(hum)
     if not hum then return end
     pcall(function()
@@ -386,7 +294,6 @@ local function bindHumanoid(hum)
         end)
     end)
 end
-
 if player.Character then
     local h = player.Character:FindFirstChildOfClass("Humanoid")
     if h then bindHumanoid(h) end
@@ -396,20 +303,16 @@ player.CharacterAdded:Connect(function(c)
     if h then bindHumanoid(h) end
 end)
 
--- =========================================================
--- FRUIT DETECTION HELPERS
--- =========================================================
+-- FRUIT HELPERS
 local function looksLikeFruit(name)
-    return tostring(name):find("^%w+%-%w+$") ~= nil
+    return tostring(name):match("^%w+%-%w+$") ~= nil
 end
-
 local function statusColor(s)
     if s == "stored" then return THEME.Green end
     if s == "inventory" then return THEME.Yellow end
     if s == "lost" then return THEME.Red end
     return THEME.Muted
 end
-
 local function statusText(s)
     if s == "stored" then return "STORED" end
     if s == "inventory" then return "IN BAG" end
@@ -417,26 +320,20 @@ local function statusText(s)
     return "UNKNOWN"
 end
 
--- =========================================================
--- CANDY CORN READER
--- =========================================================
+-- CANDY CORN
 readCandyCorn = function()
     local best, source
     for k, v in pairs(player:GetAttributes()) do
         local ks = tostring(k):lower()
         if ks:find("candy", 1, true) and type(v) == "number" then
-            if not best or v > best then
-                best, source = v, "attr." .. tostring(k)
-            end
+            if not best or v > best then best, source = v, "attr." .. tostring(k) end
         end
     end
     local ls = player:FindFirstChild("leaderstats")
     if ls then
         for _, c in ipairs(ls:GetChildren()) do
             if c:IsA("ValueBase") and type(c.Value) == "number" and c.Name:lower():find("candy", 1, true) then
-                if not best or c.Value > best then
-                    best, source = c.Value, "leaderstats." .. c.Name
-                end
+                if not best or c.Value > best then best, source = c.Value, "leaderstats." .. c.Name end
             end
         end
     end
@@ -451,115 +348,176 @@ checkCandyCornChange = function()
     if stats.lastCandyCorn ~= nil and current > stats.lastCandyCorn then
         local delta = current - stats.lastCandyCorn
         local now = os.clock()
-        local source_tag
+        local tag
         if lastTotInteractionAt and now - lastTotInteractionAt < 3 then
             stats.totCandyCorn = stats.totCandyCorn + delta
-            source_tag = "TOT"
+            tag = "TOT"
         elseif pumpkinFarm.lastKillTime and now - pumpkinFarm.lastKillTime < 3 then
-            source_tag = "FARM"
+            tag = "FARM"
         else
-            source_tag = "CC"
+            tag = "CC"
         end
-        addLog(source_tag, "Candy Corn +" .. delta .. " (source: " .. source_tag .. ", now " .. current .. ")")
-        if refreshStatsTab then refreshStatsTab() end
+        addLog(tag, "Candy Corn +" .. delta .. " (source " .. tag .. ", now " .. current .. ")")
     end
     stats.lastCandyCorn = current
 end
 
--- =========================================================
--- FRUIT SCAN
--- =========================================================
-local function scanForNewFruits()
-    local present = {}
+-- FRUIT SEED / SCAN
+seedExistingFruits = function()
+    if fruitSeeded then return end
     for _, cont in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
+        if cont then
+            for _, child in ipairs(cont:GetChildren()) do
+                if child:IsA("Tool") and looksLikeFruit(child.Name) then
+                    observedFruitTools[child] = { name = child.Name, tracked = false, seenAt = os.clock() }
+                end
+            end
+        end
+    end
+    fruitSeeded = true
+    warn("[EHF] Seeded pre-existing fruits (not tracked as gacha).")
+end
+
+local function scanForNewFruits()
+    if not fruitSeeded then seedExistingFruits() end
+    local present = {}
+    for _, cont in ipairs({ player:FindFirstChild("Backpack"), player:Character }) do
         if cont then
             for _, child in ipairs(cont:GetChildren()) do
                 if child:IsA("Tool") and looksLikeFruit(child.Name) then
                     present[child] = child.Name
                     if not observedFruitTools[child] then
-                        observedFruitTools[child] = { name = child.Name, seenAt = os.clock() }
-                        local h = fruitHistory[child.Name]
-                        if not h then
-                            h = { count = 0, status = "inventory", lastSeen = os.clock() }
-                            fruitHistory[child.Name] = h
-                        end
-                        h.status = "inventory"
-                        h.lastSeen = os.clock()
-                        local viaGacha = gacha.lastPurchaseAttemptAt and (os.clock() - gacha.lastPurchaseAttemptAt < 30)
-                        if viaGacha then
-                            h.count = h.count + 1
-                            addLog("FRUIT", "Rolled (gacha): " .. child.Name .. " (×" .. h.count .. ")")
-                            if gacha.lastConfirmedRollAt == nil or os.clock() - gacha.lastConfirmedRollAt > 1 then
-                                gacha.lastConfirmedRollAt = os.clock()
-                                updateCountdownLabels()
+                        local inWindow = gacha.pendingRollWindowUntil and os.clock() < gacha.pendingRollWindowUntil
+                        if inWindow then
+                            local h = fruitHistory[child.Name]
+                            if not h then
+                                h = { count = 0, status = "inventory", lastSeen = os.clock() }
+                                fruitHistory[child.Name] = h
                             end
+                            h.count = h.count + 1
+                            h.status = "inventory"
+                            h.lastSeen = os.clock()
+                            observedFruitTools[child] = { name = child.Name, tracked = true, seenAt = os.clock() }
+                            gacha.lastConfirmedRollAt = os.clock()
+                            gacha.pendingRollWindowUntil = nil
+                            addLog("FRUIT", "Gacha roll: " .. child.Name .. " (×" .. h.count .. ")")
+                            fruitDirty = true
+                            updateCountdownLabels()
                         else
-                            addLog("FRUIT", "Appeared: " .. child.Name .. " (source unknown)")
+                            observedFruitTools[child] = { name = child.Name, tracked = false, seenAt = os.clock() }
+                            addLog("FRUIT", "New tool not from roll: " .. child.Name)
                         end
-                        if refreshStatsTab then refreshStatsTab() end
                     end
                 end
             end
         end
     end
-    -- Detect disappeared fruit tools
     for tool, meta in pairs(observedFruitTools) do
         if not present[tool] then
-            local name = meta.name
             observedFruitTools[tool] = nil
-            local h = fruitHistory[name]
-            if h then
-                local stored = lastStoreAttempt and lastStoreAttempt.fruit == name and (os.clock() - lastStoreAttempt.time < 10)
-                local died = recentDeathAt and (os.clock() - recentDeathAt < 15)
-                if stored then
-                    h.status = "stored"
-                    addLog("FRUIT", "Confirmed stored: " .. name)
-                elseif died then
-                    h.status = "lost"
-                    addLog("FRUIT", "Lost on death (inferred, no store call): " .. name)
-                else
-                    h.status = "unknown"
-                    addLog("FRUIT", "Disappeared: " .. name .. " (unknown: stored, dropped, or traded?)")
+            if meta.tracked then
+                local h = fruitHistory[meta.name]
+                if h then
+                    local stored = lastStoreAttempt and lastStoreAttempt.fruit == meta.name and (os.clock() - lastStoreAttempt.time < 10)
+                    local died = recentDeathAt and (os.clock() - recentDeathAt < 15)
+                    if stored then h.status = "stored"; addLog("FRUIT", "Stored: " .. meta.name)
+                    elseif died then h.status = "lost"; addLog("FRUIT", "Lost on death (inferred): " .. meta.name)
+                    else h.status = "unknown"; addLog("FRUIT", "Disappeared (unknown): " .. meta.name) end
+                    fruitDirty = true
                 end
-                if refreshStatsTab then refreshStatsTab() end
             end
         end
     end
 end
 
--- =========================================================
--- GACHA RESPONSE PARSER
--- =========================================================
-local function parseGachaResponse(res)
-    if type(res) ~= "table" then return end
+-- GACHA TIMER: scan PlayerGui for game timer text
+local TIME_PATTERN = "%d+:%d+"
+local function isOurGui(obj)
+    local cur = obj
+    while cur do
+        if cur.Name == "ElitesHalloweenFarm" or cur.Name == "EHF_LoadingBanner" then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
+local function detectGachaTimerText()
+    -- If we have a cached source and it still looks valid, use it
+    if gachaTimerSource then
+        local ok = pcall(function()
+            if not gachaTimerSource.Parent or not gachaTimerSource.Visible then error("gone") end
+            local t = gachaTimerSource.Text
+            if type(t) ~= "string" or not t:match(TIME_PATTERN) then error("no match") end
+        end)
+        if ok then return gachaTimerSource.Text end
+        gachaTimerSource = nil
+    end
+    -- Full scan throttled to CONFIG.GACHA_TIMER_SCAN_INTERVAL
+    if os.clock() - gachaLastFullScan < CONFIG.GACHA_TIMER_SCAN_INTERVAL then return nil end
+    gachaLastFullScan = os.clock()
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then return nil end
+    local keyword_check = { "gacha", "halloween", "roll", "candy", "next", "reset", "cooldown" }
     local candidates = {}
-    local function walk(t, prefix)
-        for k, v in pairs(t) do
-            local key = prefix and (prefix .. "." .. tostring(k)) or tostring(k)
-            if type(v) == "number" then
-                local kl = tostring(k):lower()
-                if kl:find("cool", 1, true) or kl:find("next", 1, true) or kl:find("reset", 1, true) or kl:find("timeleft", 1, true) then
-                    table.insert(candidates, { key = key, value = v })
+    local ok, descs = pcall(function() return playerGui:GetDescendants() end)
+    if not ok then return nil end
+    for _, desc in ipairs(descs) do
+        if desc:IsA("TextLabel") and desc.Visible and not isOurGui(desc) then
+            local t = desc.Text
+            if type(t) == "string" and t:match(TIME_PATTERN) then
+                local score = 0
+                local cur = desc
+                local depth = 0
+                while cur and depth < 6 do
+                    local n = cur.Name:lower()
+                    for _, k in ipairs(keyword_check) do
+                        if n:find(k, 1, true) then score = score + 1; break end
+                    end
+                    cur = cur.Parent
+                    depth = depth + 1
                 end
-            elseif type(v) == "table" then
-                walk(v, key)
+                if score > 0 then
+                    table.insert(candidates, { label = desc, text = t, score = score })
+                end
             end
         end
     end
-    pcall(function() walk(res, "") end)
-    if #candidates > 0 then
-        local best = candidates[1]
-        addLog("GACHA", "Cooldown field candidate: " .. best.key .. " = " .. tostring(best.value))
-        if best.value > 0 and best.value < 86400 then
-            gacha.cooldownSeconds = best.value
-            addLog("GACHA", "Using parsed cooldown: " .. best.value .. "s")
-        end
-    end
+    if #candidates == 0 then return nil end
+    table.sort(candidates, function(a, b) return a.score > b.score end)
+    gachaTimerSource = candidates[1].label
+    addLog("GACHA", "Detected in-game timer source: " .. candidates[1].label:GetFullName() .. " = " .. candidates[1].text)
+    return candidates[1].text
 end
 
--- =========================================================
+updateCountdownLabels = function()
+    if not gachaTimerLabel then return end
+    local gameText = detectGachaTimerText()
+    if gameText then
+        gachaTimerLabel.Text = gameText
+        gachaStatusLabel.Text = "Game timer (live)"
+        gachaStatusLabel.TextColor3 = THEME.Green
+        return
+    end
+    if gacha.cooldownSeconds and gacha.lastConfirmedRollAt then
+        local remain = math.max(0, gacha.cooldownSeconds - (os.clock() - gacha.lastConfirmedRollAt))
+        gachaTimerLabel.Text = string.format("%02d:%02d", math.floor(remain/60), math.floor(remain%60))
+        gachaStatusLabel.Text = "Cooldown (parsed)"
+        gachaStatusLabel.TextColor3 = THEME.Green
+        return
+    end
+    if gacha.lastConfirmedRollAt then
+        local elapsed = os.clock() - gacha.lastConfirmedRollAt
+        gachaTimerLabel.Text = string.format("%02d:%02d", math.floor(elapsed/60), math.floor(elapsed%60))
+        gachaStatusLabel.Text = "Time since last roll"
+        gachaStatusLabel.TextColor3 = THEME.Muted
+        return
+    end
+    gachaTimerLabel.Text = "--:--"
+    gachaStatusLabel.Text = "No roll recorded. Open gacha menu to sync."
+    gachaStatusLabel.TextColor3 = THEME.Muted
+end
+
 -- BUILD UI
--- =========================================================
 local screenGui, main, header
 local headerH = 44
 local tabRowH = 26
@@ -573,20 +531,13 @@ local statsContent
 local gachaTimerLabel, gachaStatusLabel
 local candyCornLabel, pumpkinsFarmedLabel, totCandyCornLabel
 local fruitsScroll
-
 local activeTab = "farm"
 
 local function refreshWeaponButtons()
     if not weaponMeleeBtn or not weaponSwordBtn then return end
-    if pumpkinFarm.weaponCategory == "Melee" then
-        weaponMeleeBtn.BackgroundColor3 = THEME.Selected
-        weaponSwordBtn.BackgroundColor3 = THEME.Button
-    else
-        weaponMeleeBtn.BackgroundColor3 = THEME.Button
-        weaponSwordBtn.BackgroundColor3 = THEME.Selected
-    end
+    weaponMeleeBtn.BackgroundColor3 = pumpkinFarm.weaponCategory == "Melee" and THEME.Selected or THEME.Button
+    weaponSwordBtn.BackgroundColor3 = pumpkinFarm.weaponCategory == "Sword" and THEME.Selected or THEME.Button
 end
-
 local function setWeaponCategory(cat)
     pumpkinFarm.weaponCategory = cat
     pumpkinFarm.weaponEquippedFor = nil
@@ -594,7 +545,6 @@ local function setWeaponCategory(cat)
     addLog("WEAPON", "Category set to " .. cat)
     if updateSummary then updateSummary() end
 end
-
 local function setActiveTab(name)
     activeTab = name
     for _, c in ipairs(farmChildren) do c.Visible = (name == "farm") end
@@ -604,44 +554,26 @@ local function setActiveTab(name)
     if name == "stats" and refreshStatsTab then refreshStatsTab() end
 end
 
-updateCountdownLabels = function()
-    if not gachaTimerLabel then return end
-    if gacha.cooldownSeconds and gacha.lastConfirmedRollAt then
-        local remain = math.max(0, gacha.cooldownSeconds - (os.clock() - gacha.lastConfirmedRollAt))
-        local m = math.floor(remain / 60)
-        local s = math.floor(remain % 60)
-        gachaTimerLabel.Text = string.format("%02d:%02d", m, s)
-        gachaStatusLabel.Text = "Cooldown active (parsed)"
-    elseif gacha.lastConfirmedRollAt then
-        local elapsed = os.clock() - gacha.lastConfirmedRollAt
-        local m = math.floor(elapsed / 60)
-        local s = math.floor(elapsed % 60)
-        gachaTimerLabel.Text = string.format("%02d:%02d", m, s)
-        gachaStatusLabel.Text = "Time since last roll (cooldown unknown)"
-    else
-        gachaTimerLabel.Text = "--:--"
-        gachaStatusLabel.Text = "No roll recorded. Cooldown unverified."
-    end
-end
-
 refreshFruitList = function()
     if not fruitsScroll then return end
+    if not fruitDirty then return end
+    fruitDirty = false
     for _, c in ipairs(fruitsScroll:GetChildren()) do
         if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
     end
     local names = {}
     for n in pairs(fruitHistory) do table.insert(names, n) end
     table.sort(names)
+    local rowH = 28
     local y = 0
-    local rowH = 24
     for _, name in ipairs(names) do
         local h = fruitHistory[name]
         local row = Instance.new("Frame")
         row.BackgroundColor3 = THEME.Background
-        row.BackgroundTransparency = 0.3
+        row.BackgroundTransparency = 0.2
         row.BorderSizePixel = 0
-        row.Size = UDim2.new(1, -6, 0, rowH - 2)
-        row.Position = UDim2.fromOffset(3, y)
+        row.Size = UDim2.new(1, -8, 0, rowH)
+        row.Position = UDim2.fromOffset(4, y)
         row.ZIndex = 4
         row.Parent = fruitsScroll
         applyCorner(row, 4)
@@ -649,39 +581,46 @@ refreshFruitList = function()
         local dot = Instance.new("Frame")
         dot.BackgroundColor3 = statusColor(h.status)
         dot.BorderSizePixel = 0
-        dot.Size = UDim2.fromOffset(10, 10)
-        dot.Position = UDim2.fromOffset(6, 7)
+        dot.Size = UDim2.fromOffset(12, 12)
+        dot.Position = UDim2.new(0, 6, 0.5, 0)
+        dot.AnchorPoint = Vector2.new(0, 0.5)
         dot.ZIndex = 5
         dot.Parent = row
-        applyCorner(dot, 5)
+        applyCorner(dot, 6)
 
-        local nm = makeLabel(row, name, UDim2.new(1, -140, 1, 0), UDim2.fromOffset(22, 0), 11, THEME.Text, true)
+        local nm = makeLabel(row, name, UDim2.new(1, -164, 1, 0), UDim2.fromOffset(24, 0), 11, THEME.Text, true)
+        nm.TextXAlignment = Enum.TextXAlignment.Left
         nm.TextYAlignment = Enum.TextYAlignment.Center
         nm.TextTruncate = Enum.TextTruncate.AtEnd
         nm.ZIndex = 5
 
-        local cnt = makeLabel(row, "x" .. tostring(h.count), UDim2.fromOffset(46, 1), UDim2.new(1, -110, 0, 0), 11, THEME.Muted, false)
+        local cnt = makeLabel(row, "×" .. tostring(h.count), UDim2.fromOffset(50, 0), UDim2.new(1, -138, 0, 0), 11, THEME.Muted, true)
+        cnt.Size = UDim2.new(0, 50, 1, 0)
+        cnt.TextXAlignment = Enum.TextXAlignment.Center
         cnt.TextYAlignment = Enum.TextYAlignment.Center
         cnt.ZIndex = 5
 
-        local st = makeLabel(row, statusText(h.status), UDim2.fromOffset(74, 1), UDim2.new(1, -68, 0, 0), 10, statusColor(h.status), true)
+        local st = makeLabel(row, statusText(h.status), UDim2.fromOffset(76, 0), UDim2.new(1, -82, 0, 0), 10, statusColor(h.status), true)
+        st.Size = UDim2.new(0, 76, 1, 0)
+        st.TextXAlignment = Enum.TextXAlignment.Center
         st.TextYAlignment = Enum.TextYAlignment.Center
-        st.TextXAlignment = Enum.TextXAlignment.Right
         st.ZIndex = 5
 
-        y = y + rowH
+        y = y + rowH + 2
     end
     if #names == 0 then
-        local empty = makeLabel(fruitsScroll, "No fruits rolled yet.", UDim2.new(1, -12, 0, 20), UDim2.fromOffset(6, 4), 11, THEME.Muted, false)
+        local empty = makeLabel(fruitsScroll, "No fruits rolled yet.", UDim2.new(1, -16, 0, 20), UDim2.fromOffset(8, 6), 11, THEME.Muted, false)
+        empty.TextXAlignment = Enum.TextXAlignment.Center
+        empty.TextYAlignment = Enum.TextYAlignment.Center
         empty.ZIndex = 5
-        y = 24
+        y = 28
     end
     fruitsScroll.CanvasSize = UDim2.new(0, 0, 0, y + 8)
 end
 
 refreshStatsTab = function()
     if candyCornLabel then
-        candyCornLabel.Text = stats.currentCandyCorn and tostring(stats.currentCandyCorn) or "unknown"
+        candyCornLabel.Text = stats.currentCandyCorn and tostring(stats.currentCandyCorn) or "?"
     end
     if pumpkinsFarmedLabel then
         pumpkinsFarmedLabel.Text = tostring(stats.pumpkinsFarmed)
@@ -697,10 +636,7 @@ local function buildUI()
     local viewport
     local cam = Workspace.CurrentCamera
     if cam then viewport = cam.ViewportSize end
-    if not viewport or viewport.X < 100 or viewport.Y < 100 then
-        viewport = Vector2.new(720, 1280)
-    end
-
+    if not viewport or viewport.X < 100 or viewport.Y < 100 then viewport = Vector2.new(720, 1280) end
     local mainW = math.clamp(viewport.X - 24, 320, 420)
     local mainH = math.clamp(viewport.Y - 40, 460, 620)
     warn(string.format("[EHF] Viewport=%dx%d main=%dx%d", viewport.X, viewport.Y, mainW, mainH))
@@ -711,9 +647,8 @@ local function buildUI()
     screenGui.IgnoreGuiInset = false
     screenGui.DisplayOrder = 999999
     screenGui.Enabled = true
-    local okParent, errParent = pcall(function() screenGui.Parent = guiParent end)
-    if not okParent then error("Failed to parent ScreenGui: " .. tostring(errParent)) end
-    warn("[EHF] ScreenGui parented to " .. tostring(guiParent:GetFullName()))
+    local okP, errP = pcall(function() screenGui.Parent = guiParent end)
+    if not okP then error("Failed to parent: " .. tostring(errP)) end
 
     local banner = Instance.new("Frame")
     banner.Name = "EHF_LoadingBanner"
@@ -724,15 +659,15 @@ local function buildUI()
     banner.ZIndex = 100
     banner.Parent = screenGui
     applyCorner(banner, 10)
-    local bannerLabel = Instance.new("TextLabel")
-    bannerLabel.BackgroundTransparency = 1
-    bannerLabel.Text = "EHF LOADING"
-    bannerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-    bannerLabel.TextSize = 22
-    bannerLabel.Font = FONT_BOLD
-    bannerLabel.Size = UDim2.new(1, 0, 1, 0)
-    bannerLabel.ZIndex = 101
-    bannerLabel.Parent = banner
+    local bl = Instance.new("TextLabel")
+    bl.BackgroundTransparency = 1
+    bl.Text = "EHF LOADING"
+    bl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    bl.TextSize = 22
+    bl.Font = FONT_BOLD
+    bl.Size = UDim2.new(1, 0, 1, 0)
+    bl.ZIndex = 101
+    bl.Parent = banner
 
     main = Instance.new("Frame")
     main.Name = "Main"
@@ -751,11 +686,10 @@ local function buildUI()
 
     header = makeFrame(main, THEME.Panel, UDim2.new(1, 0, 0, headerH), UDim2.fromOffset(0, 0), "Header")
     header.ZIndex = 3
-
     local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
     title.ZIndex = 4
-    local subtitle = makeLabel(header, "v8 · nearest-target · stats · water-safe", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
-    subtitle.ZIndex = 4
+    local sub = makeLabel(header, "v9 · nearest · timer · stats", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+    sub.ZIndex = 4
 
     minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
     minBtn.ZIndex = 5
@@ -763,9 +697,7 @@ local function buildUI()
     closeBtn.BackgroundColor3 = THEME.Danger
     closeBtn.ZIndex = 5
 
-    -- Tab row
     local tabRow = Instance.new("Frame")
-    tabRow.Name = "TabRow"
     tabRow.BackgroundTransparency = 1
     tabRow.Position = UDim2.fromOffset(6, headerH + 2)
     tabRow.Size = UDim2.new(1, -12, 0, tabRowH)
@@ -788,7 +720,7 @@ local function buildUI()
     local contentBottom = mainH - 6
     local contentHeight = contentBottom - contentTop
 
-    -- ============ FARM CONTENT (existing layout preserved) ============
+    -- FARM TAB
     local toolbarH = 128
     local toolbar = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, toolbarH), UDim2.fromOffset(contentLeft, contentTop), "Toolbar")
     toolbar.ZIndex = 3
@@ -899,9 +831,9 @@ local function buildUI()
     weaponRow.ZIndex = 4
     weaponRow.Parent = toolbar
 
-    local weaponLabel = makeLabel(weaponRow, "Weapon:", UDim2.fromOffset(60, 26), UDim2.fromOffset(0, 0), 11, THEME.Text, true)
-    weaponLabel.TextYAlignment = Enum.TextYAlignment.Center
-    weaponLabel.ZIndex = 5
+    local wL = makeLabel(weaponRow, "Weapon:", UDim2.fromOffset(60, 26), UDim2.fromOffset(0, 0), 11, THEME.Text, true)
+    wL.TextYAlignment = Enum.TextYAlignment.Center
+    wL.ZIndex = 5
 
     weaponMeleeBtn = makeButton(weaponRow, "Melee", UDim2.fromOffset(80, 26), UDim2.fromOffset(58, 0))
     weaponMeleeBtn.TextSize = 12
@@ -926,12 +858,10 @@ local function buildUI()
     if logH < 60 then logH = 60 end
 
     featureScroll = Instance.new("ScrollingFrame")
-    featureScroll.Name = "FeatureList"
     featureScroll.BackgroundColor3 = THEME.Panel
     featureScroll.BackgroundTransparency = 0
     featureScroll.BorderSizePixel = 1
     featureScroll.BorderColor3 = THEME.Border
-    featureScroll.Visible = true
     featureScroll.Position = UDim2.fromOffset(contentLeft, featureY)
     featureScroll.Size = UDim2.fromOffset(contentWidth, featureH)
     featureScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
@@ -941,23 +871,23 @@ local function buildUI()
     featureScroll.Parent = main
     applyCorner(featureScroll, 8)
 
-    local featureLayout = Instance.new("UIListLayout")
-    featureLayout.Padding = UDim.new(0, 6)
-    featureLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    featureLayout.Parent = featureScroll
+    local fl = Instance.new("UIListLayout")
+    fl.Padding = UDim.new(0, 6)
+    fl.SortOrder = Enum.SortOrder.LayoutOrder
+    fl.Parent = featureScroll
 
     local summary = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, summaryH), UDim2.fromOffset(contentLeft, summaryY), "Summary")
     summary.ZIndex = 3
-    local summaryTitle = makeLabel(summary, "LOCAL STATUS", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
-    summaryTitle.ZIndex = 4
+    local sT = makeLabel(summary, "LOCAL STATUS", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
+    sT.ZIndex = 4
     summaryStatus = makeLabel(summary, "No features running.", UDim2.new(1, -16, 0, 18), UDim2.fromOffset(8, 24), 11, THEME.Muted, false)
     summaryStatus.ZIndex = 4
     summaryStatus.TextWrapped = true
 
     local logFrame = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, logH), UDim2.fromOffset(contentLeft, logY), "LogFrame")
     logFrame.ZIndex = 3
-    local logTitle = makeLabel(logFrame, "ACTIVITY LOG", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
-    logTitle.ZIndex = 4
+    local lT = makeLabel(logFrame, "ACTIVITY LOG", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
+    lT.ZIndex = 4
 
     logScroll = Instance.new("ScrollingFrame")
     logScroll.BackgroundTransparency = 1
@@ -987,7 +917,7 @@ local function buildUI()
 
     farmChildren = { toolbar, featureScroll, summary, logFrame }
 
-    -- ============ STATS CONTENT ============
+    -- STATS TAB (centered layout)
     statsContent = Instance.new("Frame")
     statsContent.Name = "StatsContent"
     statsContent.BackgroundTransparency = 1
@@ -997,59 +927,62 @@ local function buildUI()
     statsContent.Visible = false
     statsContent.Parent = main
 
-    -- Gacha timer section
-    local gachaSec = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, 70), UDim2.fromOffset(0, 0), "GachaSec")
+    -- Gacha timer (centered)
+    local gachaSec = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, 76), UDim2.fromOffset(0, 0), "GachaSec")
     gachaSec.ZIndex = 4
-    local gachaTitle = makeLabel(gachaSec, "GACHA TIMER", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
-    gachaTitle.ZIndex = 5
-    gachaTimerLabel = makeLabel(gachaSec, "--:--", UDim2.new(1, -16, 0, 30), UDim2.fromOffset(8, 18), 24, THEME.Text, true)
+    local gTitle = makeLabel(gachaSec, "GACHA TIMER", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
+    gTitle.TextXAlignment = Enum.TextXAlignment.Center
+    gTitle.ZIndex = 5
+    gachaTimerLabel = makeLabel(gachaSec, "--:--", UDim2.new(1, -16, 0, 32), UDim2.fromOffset(8, 20), 24, THEME.Text, true)
+    gachaTimerLabel.TextXAlignment = Enum.TextXAlignment.Center
+    gachaTimerLabel.TextYAlignment = Enum.TextYAlignment.Center
     gachaTimerLabel.ZIndex = 5
-    gachaStatusLabel = makeLabel(gachaSec, "", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 50), 10, THEME.Muted, false)
+    gachaStatusLabel = makeLabel(gachaSec, "", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 54), 10, THEME.Muted, false)
+    gachaStatusLabel.TextXAlignment = Enum.TextXAlignment.Center
+    gachaStatusLabel.TextYAlignment = Enum.TextYAlignment.Center
     gachaStatusLabel.ZIndex = 5
 
-    -- Counters section
-    local countersSec = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, 66), UDim2.fromOffset(0, 76), "CountersSec")
+    -- Counters (centered)
+    local countersSec = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, 100), UDim2.fromOffset(0, 82), "CountersSec")
     countersSec.ZIndex = 4
-    local countersTitle = makeLabel(countersSec, "FARM STATS", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
-    countersTitle.ZIndex = 5
+    local cT = makeLabel(countersSec, "FARM STATS", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
+    cT.TextXAlignment = Enum.TextXAlignment.Center
+    cT.ZIndex = 5
 
-    local ccL = makeLabel(countersSec, "Candy Corn:", UDim2.fromOffset(90, 18), UDim2.fromOffset(8, 22), 10, THEME.Muted, false)
-    ccL.ZIndex = 5
-    candyCornLabel = makeLabel(countersSec, "?", UDim2.new(1, -106, 0, 18), UDim2.fromOffset(102, 22), 11, THEME.Text, true)
-    candyCornLabel.ZIndex = 5
+    local function addCounterRow(yOff, labelText)
+        local row = Instance.new("Frame")
+        row.BackgroundColor3 = THEME.Background
+        row.BackgroundTransparency = 0.35
+        row.BorderSizePixel = 0
+        row.Size = UDim2.new(1, -16, 0, 20)
+        row.Position = UDim2.fromOffset(8, yOff)
+        row.ZIndex = 5
+        row.Parent = countersSec
+        applyCorner(row, 4)
+        local lbl = makeLabel(row, labelText, UDim2.new(0.55, -8, 1, 0), UDim2.fromOffset(8, 0), 10, THEME.Muted, false)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextYAlignment = Enum.TextYAlignment.Center
+        lbl.ZIndex = 6
+        local val = makeLabel(row, "?", UDim2.new(0.45, -8, 1, 0), UDim2.new(0.55, 4, 0, 0), 11, THEME.Text, true)
+        val.TextXAlignment = Enum.TextXAlignment.Right
+        val.TextYAlignment = Enum.TextYAlignment.Center
+        val.ZIndex = 6
+        return val
+    end
 
-    local pfL = makeLabel(countersSec, "Pumpkins Farmed:", UDim2.fromOffset(120, 18), UDim2.fromOffset(8, 42), 10, THEME.Muted, false)
-    pfL.ZIndex = 5
-    pumpkinsFarmedLabel = makeLabel(countersSec, "0", UDim2.new(1, -136, 0, 18), UDim2.fromOffset(132, 42), 11, THEME.Text, true)
-    pumpkinsFarmedLabel.ZIndex = 5
+    candyCornLabel = addCounterRow(22, "Candy Corn:")
+    pumpkinsFarmedLabel = addCounterRow(44, "Pumpkins Farmed:")
+    totCandyCornLabel = addCounterRow(66, "ToT Candy Corn:")
+    countersSec.Size = UDim2.new(1, 0, 0, 92)
 
-    local totL = makeLabel(countersSec, "ToT Candy Corn:", UDim2.fromOffset(120, 18), UDim2.new(0.5, 4, 0, 18), UDim2.fromOffset(8, 62 - 18))
-    totL.Size = UDim2.fromOffset(120, 0)  -- will reposition
-    totL:Destroy()
-
-    -- Rebuild third row properly
-    local totRow = Instance.new("Frame")
-    totRow.BackgroundTransparency = 1
-    totRow.Position = UDim2.fromOffset(8, 62)
-    totRow.Size = UDim2.new(1, -16, 0, 0)
-    totRow.ZIndex = 5
-    totRow.Parent = countersSec
-    countersSec.Size = UDim2.new(1, 0, 0, 86)
-    countersTitle.Text = "FARM STATS"
-
-    local totLbl = makeLabel(countersSec, "ToT Candy Corn:", UDim2.fromOffset(120, 18), UDim2.fromOffset(8, 62), 10, THEME.Muted, false)
-    totLbl.ZIndex = 5
-    totCandyCornLabel = makeLabel(countersSec, "0", UDim2.new(1, -136, 0, 18), UDim2.fromOffset(132, 62), 11, THEME.Text, true)
-    totCandyCornLabel.ZIndex = 5
-    totRow:Destroy()
-
-    -- Fruit list section
-    local fruitY = 76 + 86 + 6
+    -- Fruit list
+    local fruitY = 82 + 98
     local fruitH = contentHeight - fruitY
     local fruitFrame = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, fruitH), UDim2.fromOffset(0, fruitY), "FruitFrame")
     fruitFrame.ZIndex = 4
-    local fruitTitle = makeLabel(fruitFrame, "FRUIT HISTORY (rolled / stored / lost)", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
-    fruitTitle.ZIndex = 5
+    local fT = makeLabel(fruitFrame, "GACHA FRUIT HISTORY", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
+    fT.TextXAlignment = Enum.TextXAlignment.Center
+    fT.ZIndex = 5
 
     fruitsScroll = Instance.new("ScrollingFrame")
     fruitsScroll.BackgroundTransparency = 1
@@ -1064,18 +997,14 @@ local function buildUI()
 
     setActiveTab("farm")
     warn("[EHF] Base UI built.")
-
     task.delay(2, function()
-        if banner and banner.Parent then
-            banner:Destroy()
-            warn("[EHF] Loading banner removed.")
-        end
+        if banner and banner.Parent then banner:Destroy(); warn("[EHF] Loading banner removed.") end
     end)
 end
 
 local okBuild, errBuild = pcall(buildUI)
 if not okBuild or not screenGui then
-    warn("[EHF] UI construction failed: " .. tostring(errBuild))
+    warn("[EHF] UI build failed: " .. tostring(errBuild))
     if guiParent then
         local orphan = guiParent:FindFirstChild("ElitesHalloweenFarm")
         if orphan then orphan:Destroy() end
@@ -1083,9 +1012,7 @@ if not okBuild or not screenGui then
     return
 end
 
--- =========================================================
 -- FEATURE REGISTRY
--- =========================================================
 local features = {}
 local featureOrder = {}
 
@@ -1096,10 +1023,7 @@ updateSummary = function()
         if f and f.running then running = running + 1 end
     end
     if summaryStatus then
-        summaryStatus.Text = string.format(
-            "%d running · %d lines · %d/s · %s",
-            running, #logLines, pumpkinFarm.speed, pumpkinFarm.weaponCategory
-        )
+        summaryStatus.Text = string.format("%d running · %d lines · %d/s · %s", running, #logLines, pumpkinFarm.speed, pumpkinFarm.weaponCategory)
     end
 end
 
@@ -1107,16 +1031,12 @@ local function setFeatureStatus(id, text)
     local f = features[id]
     if f and f.statusLabel then f.statusLabel.Text = tostring(text) end
 end
-
 local function refreshFeature(f)
     if not f then return end
     f.btn.Text = f.running and "Stop" or "Start"
     f.btn.BackgroundColor3 = f.running and Color3.fromRGB(90, 32, 52) or THEME.Button
-    if f.statusLabel then
-        f.statusLabel.TextColor3 = f.running and THEME.Green or THEME.Muted
-    end
+    if f.statusLabel then f.statusLabel.TextColor3 = f.running and THEME.Green or THEME.Muted end
 end
-
 local function setFeatureRunning(id, running, silent)
     local f = features[id]
     if not f or f.running == running then return end
@@ -1124,21 +1044,15 @@ local function setFeatureRunning(id, running, silent)
     if running then
         if f.onStart then
             local ok, err = pcall(f.onStart)
-            if not ok then
-                addLog("ERROR", f.name .. " start failed: " .. tostring(err))
-                f.running = false
-            end
+            if not ok then addLog("ERROR", f.name .. " start failed: " .. tostring(err)); f.running = false end
         end
     else
         if f.onStop then pcall(f.onStop) end
     end
     refreshFeature(f)
     updateSummary()
-    if not silent then
-        addLog("FEATURE", f.name .. " " .. (f.running and "started" or "stopped"))
-    end
+    if not silent then addLog("FEATURE", f.name .. " " .. (f.running and "started" or "stopped")) end
 end
-
 local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, extraCallback)
     local row = Instance.new("Frame")
     row.Name = id
@@ -1147,28 +1061,24 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
     row.BackgroundTransparency = 0
     row.BorderSizePixel = 1
     row.BorderColor3 = THEME.Border
-    row.Visible = true
     row.ZIndex = 4
     row.Parent = featureScroll
     applyCorner(row, 8)
 
-    local titleLabel = makeLabel(row, name, UDim2.new(1, -150, 0, 18), UDim2.fromOffset(10, 5), 13, THEME.Text, true)
-    titleLabel.ZIndex = 5
-    titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    local descLabel = makeLabel(row, desc, UDim2.new(1, -150, 0, 16), UDim2.fromOffset(10, 23), 10, THEME.Muted, false)
-    descLabel.ZIndex = 5
-    descLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    local statusLabel = makeLabel(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted, false)
-    statusLabel.ZIndex = 5
-    statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    local t = makeLabel(row, name, UDim2.new(1, -150, 0, 18), UDim2.fromOffset(10, 5), 13, THEME.Text, true)
+    t.ZIndex = 5; t.TextTruncate = Enum.TextTruncate.AtEnd
+    local d = makeLabel(row, desc, UDim2.new(1, -150, 0, 16), UDim2.fromOffset(10, 23), 10, THEME.Muted, false)
+    d.ZIndex = 5; d.TextTruncate = Enum.TextTruncate.AtEnd
+    local s = makeLabel(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted, false)
+    s.ZIndex = 5; s.TextTruncate = Enum.TextTruncate.AtEnd
     local btn = makeButton(row, "Start", UDim2.fromOffset(64, 28), UDim2.new(1, -74, 0, 5))
     btn.ZIndex = 6
 
     if extraText then
-        local extraBtn = makeButton(row, extraText, UDim2.fromOffset(64, 22), UDim2.new(1, -74, 0, 35))
-        extraBtn.TextSize = 10
-        extraBtn.ZIndex = 6
-        extraBtn.MouseButton1Click:Connect(function()
+        local eB = makeButton(row, extraText, UDim2.fromOffset(64, 22), UDim2.new(1, -74, 0, 35))
+        eB.TextSize = 10
+        eB.ZIndex = 6
+        eB.MouseButton1Click:Connect(function()
             if extraCallback then
                 local ok, err = pcall(extraCallback)
                 if not ok then addLog("ERROR", name .. " action failed: " .. tostring(err)) end
@@ -1176,11 +1086,7 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
         end)
     end
 
-    local f = {
-        id = id, name = name, running = false,
-        onStart = onStart, onStop = onStop, onTick = onTick,
-        btn = btn, statusLabel = statusLabel, row = row,
-    }
+    local f = { id = id, name = name, running = false, onStart = onStart, onStop = onStop, onTick = onTick, btn = btn, statusLabel = s, row = row }
     features[id] = f
     table.insert(featureOrder, id)
     btn.MouseButton1Click:Connect(function() setFeatureRunning(id, not f.running) end)
@@ -1188,128 +1094,96 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
     return f
 end
 
--- =========================================================
 -- REMOTE HELPERS
--- =========================================================
 local function getNet()
-    local modules = ReplicatedStorage:FindFirstChild("Modules")
-    if not modules then return nil end
-    return modules:FindFirstChild("Net")
+    local m = ReplicatedStorage:FindFirstChild("Modules")
+    return m and m:FindFirstChild("Net")
 end
 local function findRemotePath(root, path)
     local cur = root
-    for _, name in ipairs(path) do
+    for _, n in ipairs(path) do
         if not cur then return nil end
-        cur = cur:FindFirstChild(name)
+        cur = cur:FindFirstChild(n)
     end
     return cur
 end
 local function getGachaRF()
-    local net = getNet()
-    return net and net:FindFirstChild("RF/GachaNetworkRF")
+    local n = getNet()
+    return n and n:FindFirstChild("RF/GachaNetworkRF")
 end
 local function getRegisterAttack()
-    local net = getNet()
-    return net and net:FindFirstChild("RE/RegisterAttack")
+    local n = getNet()
+    return n and n:FindFirstChild("RE/RegisterAttack")
 end
 local function getRegisterHit()
-    local net = getNet()
-    return net and net:FindFirstChild("RE/RegisterHit")
+    local n = getNet()
+    return n and n:FindFirstChild("RE/RegisterHit")
 end
 
--- =========================================================
--- WATER HELPERS
--- =========================================================
-local function getWaterHeightAt(x, z)
+-- WATER-SAFE COMPUTE (no bunny hopping)
+local function computeSafeFlyTarget(targetPos, pumpkinModel)
+    local safeY = targetPos.Y + CONFIG.FLY_HOVER_HEIGHT
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
+    local exclude = {}
     local char = player.Character
-    if char then params.FilterDescendantsInstances = { char } end
+    if char then table.insert(exclude, char) end
+    if pumpkinModel then table.insert(exclude, pumpkinModel) end
+    params.FilterDescendantsInstances = exclude
     params.IgnoreWater = false
     params.RespectCanCollide = false
 
-    local origin = Vector3.new(x, 2000, z)
-    local dir = Vector3.new(0, -4000, 0)
+    local origin = Vector3.new(targetPos.X, targetPos.Y + 20, targetPos.Z)
+    local dir = Vector3.new(0, -200, 0)
     local ok, result = pcall(function() return Workspace:Raycast(origin, dir, params) end)
-    if not ok or not result then return nil end
-
-    local inst = result.Instance
-    local mat = result.Material
-    local isWater = (mat == Enum.Material.Water)
-    if not isWater and inst then
-        local n = inst.Name:lower()
-        if n:find("water", 1, true) or n:find("ocean", 1, true) then
-            isWater = true
+    if ok and result then
+        local mat = result.Material
+        local inst = result.Instance
+        local isWater = mat == Enum.Material.Water
+        if not isWater and inst then
+            local n = inst.Name:lower()
+            if n:find("water", 1, true) or n:find("ocean", 1, true) then isWater = true end
         end
-    end
-    if isWater then return result.Position.Y end
-    return nil, result.Position.Y
-end
-
-local function computeSafeFlyTarget(targetPos)
-    local waterY, groundY = getWaterHeightAt(targetPos.X, targetPos.Z)
-    local safeY = targetPos.Y
-    if waterY then
-        local minY = waterY + CONFIG.MIN_HEIGHT_ABOVE_WATER
-        if safeY < minY then safeY = minY end
-    elseif groundY then
-        local minY = groundY + 3
-        if safeY < minY then safeY = minY end
+        if isWater then
+            safeY = math.max(safeY, result.Position.Y + CONFIG.MIN_HEIGHT_ABOVE_WATER)
+        else
+            safeY = math.max(safeY, result.Position.Y + CONFIG.FLY_HOVER_HEIGHT)
+        end
     end
     return Vector3.new(targetPos.X, safeY, targetPos.Z)
 end
 
--- =========================================================
 -- WEAPON HELPERS
--- =========================================================
 local MELEE_STYLES = {
-    "combat", "dark step", "electric", "water kung fu",
-    "dragon breath", "superhuman", "death step",
-    "sharkman karate", "electric claw", "dragon talon",
-    "godhuman", "sanguine art",
+    "combat","dark step","electric","water kung fu","dragon breath","superhuman",
+    "death step","sharkman karate","electric claw","dragon talon","godhuman","sanguine art",
 }
-
 local function isMeleeStyle(name)
     local n = tostring(name):lower()
-    for _, s in ipairs(MELEE_STYLES) do
-        if n:find(s, 1, true) then return true end
-    end
+    for _, s in ipairs(MELEE_STYLES) do if n:find(s, 1, true) then return true end end
     return false
 end
-
-local function looksLikeFruitTool(name)
-    return tostring(name):find("%-") ~= nil
-end
-
 local function equipWeaponOfCategory(category)
     local char = player.Character
     if not char then return nil end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return nil end
-
-    local current = char:FindFirstChildOfClass("Tool")
-    if current then
-        local isMelee = isMeleeStyle(current.Name)
-        if (category == "Melee" and isMelee) or (category == "Sword" and not isMelee and not looksLikeFruitTool(current.Name)) then
-            return current
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    local cur = char:FindFirstChildOfClass("Tool")
+    if cur then
+        local isM = isMeleeStyle(cur.Name)
+        if (category == "Melee" and isM) or (category == "Sword" and not isM and not looksLikeFruit(cur.Name)) then
+            return cur
         end
     end
-
-    local backpack = player:FindFirstChild("Backpack")
-    if not backpack then return nil end
-
-    for _, tool in ipairs(backpack:GetChildren()) do
+    local bp = player:FindFirstChild("Backpack")
+    if not bp then return nil end
+    for _, tool in ipairs(bp:GetChildren()) do
         if tool:IsA("Tool") then
-            local isMelee = isMeleeStyle(tool.Name)
-            local isFruit = looksLikeFruitTool(tool.Name)
-            local match = false
-            if category == "Melee" then
-                match = isMelee
-            elseif category == "Sword" then
-                match = (not isMelee) and (not isFruit)
-            end
+            local isM = isMeleeStyle(tool.Name)
+            local isF = looksLikeFruit(tool.Name)
+            local match = (category == "Melee" and isM) or (category == "Sword" and not isM and not isF)
             if match then
-                pcall(function() humanoid:EquipTool(tool) end)
+                pcall(function() hum:EquipTool(tool) end)
                 return tool
             end
         end
@@ -1317,31 +1191,25 @@ local function equipWeaponOfCategory(category)
     return nil
 end
 
--- =========================================================
--- NEAREST PUMPKIN (with diagnostics)
--- =========================================================
+-- NEAREST PUMPKIN
 local function findClosestPumpkin()
     local hunt = Workspace:FindFirstChild("PumpkinHunt")
     if not hunt then return nil, nil, nil end
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil, nil, nil end
-
     local now = os.clock()
     local best, bestDist, bestRoot = nil, math.huge, nil
-    local ok, descendants = pcall(function() return hunt:GetDescendants() end)
+    local ok, desc = pcall(function() return hunt:GetDescendants() end)
     if not ok then return nil, nil, nil end
-
-    for _, d in ipairs(descendants) do
+    for _, d in ipairs(desc) do
         if d:IsA("Model") and d.Parent and d.Name:lower():find("pumpkin", 1, true) then
             local bl = pumpkinFarm.blacklist[d]
             if not (bl and bl > now) then
                 local root = d:FindFirstChild("RootPart") or d:FindFirstChild("HumanoidRootPart")
                 if root and root:IsA("BasePart") and root.Parent then
                     local dist = (root.Position - hrp.Position).Magnitude
-                    if dist < bestDist then
-                        best, bestDist, bestRoot = d, dist, root
-                    end
+                    if dist < bestDist then best, bestDist, bestRoot = d, dist, root end
                 end
             end
         end
@@ -1350,20 +1218,17 @@ local function findClosestPumpkin()
 end
 
 local function fireRegisterAttack()
-    local remote = getRegisterAttack()
-    if not remote then return false end
-    return (pcall(function() remote:FireServer(0.4000000059604645, 1) end))
+    local r = getRegisterAttack()
+    if not r then return false end
+    return (pcall(function() r:FireServer(0.4000000059604645, 1) end))
 end
-
 local function fireRegisterHit(rootPart)
-    local remote = getRegisterHit()
-    if not remote or not rootPart then return false end
-    return (pcall(function() remote:FireServer(rootPart) end))
+    local r = getRegisterHit()
+    if not r or not rootPart then return false end
+    return (pcall(function() r:FireServer(rootPart) end))
 end
 
--- =========================================================
--- RENDER LOOP (fly + water safety + noclip)
--- =========================================================
+-- RENDER LOOP (fly + noclip only — no water snap)
 RunService.RenderStepped:Connect(function(dt)
     if not pumpkinFarm.running then return end
     local char = player.Character
@@ -1404,23 +1269,10 @@ RunService.RenderStepped:Connect(function(dt)
             local step = math.min(dist, pumpkinFarm.speed * dt)
             hrp.CFrame = hrp.CFrame + offset.Unit * step
         end
-        if os.clock() - pumpkinFarm.lastWaterCheck > CONFIG.WATER_CHECK_INTERVAL then
-            pumpkinFarm.lastWaterCheck = os.clock()
-            local waterY = getWaterHeightAt(hrp.Position.X, hrp.Position.Z)
-            if waterY and hrp.Position.Y < waterY + CONFIG.MIN_HEIGHT_ABOVE_WATER then
-                local liftTo = waterY + CONFIG.MIN_HEIGHT_ABOVE_WATER + 1
-                hrp.CFrame = CFrame.new(hrp.Position.X, liftTo, hrp.Position.Z) * (hrp.CFrame - hrp.CFrame.Position)
-                if pumpkinFarm.flyTarget then
-                    pumpkinFarm.flyTarget = Vector3.new(pumpkinFarm.flyTarget.X, math.max(pumpkinFarm.flyTarget.Y, liftTo), pumpkinFarm.flyTarget.Z)
-                end
-            end
-        end
     end
 end)
 
--- =========================================================
--- PUMPKIN FARM TICK (fixed nearest logic)
--- =========================================================
+-- PUMPKIN FARM TICK
 local function resetStuckTracking()
     pumpkinFarm.stuckTime = 0
     pumpkinFarm.lastDistance = nil
@@ -1429,24 +1281,20 @@ local function resetStuckTracking()
     pumpkinFarm.oscillationCount = 0
     pumpkinFarm.attackStartedAt = nil
 end
-
 local function setTarget(p, r, dist, reason)
     pumpkinFarm.currentPumpkin = p
     pumpkinFarm.currentRoot = r
-    pumpkinFarm.lastSelectedDistance = dist
     resetStuckTracking()
-    local safePos = computeSafeFlyTarget(r.Position)
-    pumpkinFarm.flyTarget = safePos
+    pumpkinFarm.flyTarget = computeSafeFlyTarget(r.Position, p)
     pumpkinFarm.state = "MOVING"
     pumpkinFarm.weaponEquippedFor = nil
     addLog("PUMPKIN", string.format("Selected %s @ %.1f studs (%s)", tostring(p.Name), dist or -1, reason or "?"))
 end
-
 local function blacklistTarget(reason)
     local p = pumpkinFarm.currentPumpkin
     if p then
         pumpkinFarm.blacklist[p] = os.clock() + CONFIG.BLACKLIST_DURATION
-        addLog("PUMPKIN", string.format("Blacklisting %s for %ds (%s)", tostring(p.Name), CONFIG.BLACKLIST_DURATION, reason))
+        addLog("PUMPKIN", string.format("Blacklist %s for %ds (%s)", tostring(p.Name), CONFIG.BLACKLIST_DURATION, reason))
     end
     pumpkinFarm.currentPumpkin = nil
     pumpkinFarm.currentRoot = nil
@@ -1458,28 +1306,21 @@ end
 local function pumpkinFarmTick()
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then
-        setFeatureStatus("pumpkin", "no character")
-        return
-    end
+    if not hrp then setFeatureStatus("pumpkin", "no character"); return end
 
-    -- prune blacklist
     local now = os.clock()
     for k, v in pairs(pumpkinFarm.blacklist) do
         if v < now or not k.Parent then pumpkinFarm.blacklist[k] = nil end
     end
 
-    -- Validate current target
     if pumpkinFarm.currentPumpkin then
         local p = pumpkinFarm.currentPumpkin
         local r = pumpkinFarm.currentRoot
         if not p.Parent or not r or not r.Parent then
-            -- Possible kill detection: if we were attacking this target, count it
             if pumpkinFarm.state == "ATTACKING" then
                 stats.pumpkinsFarmed = stats.pumpkinsFarmed + 1
                 pumpkinFarm.lastKillTime = os.clock()
-                addLog("PUMPKIN", string.format("Target disappeared while attacking. Pumpkins farmed: %d", stats.pumpkinsFarmed))
-                if refreshStatsTab then refreshStatsTab() end
+                addLog("PUMPKIN", string.format("Target disappeared while attacking. Farmed: %d", stats.pumpkinsFarmed))
             else
                 addLog("PUMPKIN", "Target gone (was not attacking)")
             end
@@ -1488,11 +1329,9 @@ local function pumpkinFarmTick()
             pumpkinFarm.flyTarget = nil
             pumpkinFarm.weaponEquippedFor = nil
             resetStuckTracking()
-            -- fall through to acquire immediately
         end
     end
 
-    -- Acquire target if none — no 5s gate; scan every tick
     if not pumpkinFarm.currentPumpkin then
         local p, r, dist = findClosestPumpkin()
         if p and r then
@@ -1503,7 +1342,7 @@ local function pumpkinFarmTick()
             pumpkinFarm.flyTarget = nil
             if not pumpkinFarm.lastRespawnAt then
                 pumpkinFarm.lastRespawnAt = os.clock()
-                addLog("PUMPKIN", "No pumpkins available. Waiting.")
+                addLog("PUMPKIN", "No pumpkins. Waiting.")
             end
             local elapsed = os.clock() - pumpkinFarm.lastRespawnAt
             setFeatureStatus("pumpkin", string.format("waiting (%.0fs)", elapsed))
@@ -1511,7 +1350,6 @@ local function pumpkinFarmTick()
         end
     end
 
-    -- During MOVING: if a closer pumpkin appears, switch
     local root = pumpkinFarm.currentRoot
     local pumpkin = pumpkinFarm.currentPumpkin
     if not root or not pumpkin then return end
@@ -1521,23 +1359,20 @@ local function pumpkinFarmTick()
     if pumpkinFarm.state == "MOVING" and dist > CONFIG.SWITCH_MIN_DIST then
         local np, nr, ndist = findClosestPumpkin()
         if np and np ~= pumpkin and ndist and ndist < dist - CONFIG.SWITCH_MARGIN then
-            addLog("PUMPKIN", string.format("Switching to closer pumpkin (%.1f < %.1f)", ndist, dist))
+            addLog("PUMPKIN", string.format("Switch closer (%.1f < %.1f)", ndist, dist))
             setTarget(np, nr, ndist, "closer")
             return
         end
     end
 
-    -- Throttled diagnostic
     if os.clock() - pumpkinFarm.lastDistLog > CONFIG.TARGET_DIST_LOG_INTERVAL then
         pumpkinFarm.lastDistLog = os.clock()
         addLog("PUMPKIN", string.format("Current target %s: %.1f studs", tostring(pumpkin.Name), dist))
     end
 
-    -- Progress tracking (only during MOVING)
     if pumpkinFarm.state == "MOVING" then
         if pumpkinFarm.lastDistance then
-            local delta = pumpkinFarm.lastDistance - dist
-            if delta < CONFIG.PROGRESS_THRESHOLD then
+            if (pumpkinFarm.lastDistance - dist) < CONFIG.PROGRESS_THRESHOLD then
                 pumpkinFarm.stuckTime = pumpkinFarm.stuckTime + CONFIG.STUCK_TICK_DT
             else
                 pumpkinFarm.stuckTime = 0
@@ -1545,7 +1380,6 @@ local function pumpkinFarmTick()
         end
         pumpkinFarm.lastDistance = dist
 
-        -- Oscillation
         if pumpkinFarm.lastY then
             local dy = hrp.Position.Y - pumpkinFarm.lastY
             if pumpkinFarm.lastDy and math.abs(dy) > 0.1 and math.abs(pumpkinFarm.lastDy) > 0.1 then
@@ -1569,7 +1403,7 @@ local function pumpkinFarmTick()
 
     if dist > CONFIG.TOUCH_DISTANCE then
         if not pumpkinFarm.flyTarget then
-            pumpkinFarm.flyTarget = computeSafeFlyTarget(root.Position)
+            pumpkinFarm.flyTarget = computeSafeFlyTarget(root.Position, pumpkin)
         end
         pumpkinFarm.state = "MOVING"
         setFeatureStatus("pumpkin", string.format("flying %.0f @ %d/s", dist, pumpkinFarm.speed))
@@ -1579,37 +1413,27 @@ local function pumpkinFarmTick()
             pumpkinFarm.state = "ATTACKING"
             pumpkinFarm.attackStartedAt = os.clock()
         end
-
         if pumpkinFarm.weaponEquippedFor ~= pumpkin then
-            local equipped = equipWeaponOfCategory(pumpkinFarm.weaponCategory)
+            local eq = equipWeaponOfCategory(pumpkinFarm.weaponCategory)
             pumpkinFarm.weaponEquippedFor = pumpkin
-            if equipped then
-                addLog("WEAPON", "Equipped: " .. equipped.Name .. " (" .. pumpkinFarm.weaponCategory .. ")")
-            else
-                addLog("WEAPON", "No tool matched " .. pumpkinFarm.weaponCategory .. "; keeping current.")
-            end
+            if eq then addLog("WEAPON", "Equipped: " .. eq.Name .. " (" .. pumpkinFarm.weaponCategory .. ")")
+            else addLog("WEAPON", "No match for " .. pumpkinFarm.weaponCategory .. "; keeping current.") end
         end
-
-        local currentTool = char and char:FindFirstChildOfClass("Tool")
-        local style = currentTool and currentTool.Name or "Combat"
+        local cur = char and char:FindFirstChildOfClass("Tool")
+        local style = cur and cur.Name or "Combat"
         setFeatureStatus("pumpkin", "attacking " .. pumpkin.Name .. " (" .. style .. ")")
-
         pcall(function()
             hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(root.Position.X, hrp.Position.Y, root.Position.Z))
         end)
-
         if os.clock() - pumpkinFarm.lastAttackTime >= CONFIG.ATTACK_COOLDOWN then
             pumpkinFarm.lastAttackTime = os.clock()
             local aOk = fireRegisterAttack()
             local hOk = fireRegisterHit(root)
             if not aOk and not hOk then
-                addLog("PUMPKIN", "Attack remotes unavailable.")
+                addLog("PUMPKIN", "Attack remotes missing.")
                 setFeatureStatus("pumpkin", "attack remotes missing")
             end
         end
-
-        -- Attack timeout: if we've been adjacent for too long without the pumpkin disappearing,
-        -- assume server is rejecting hits and try another target.
         if pumpkinFarm.attackStartedAt and os.clock() - pumpkinFarm.attackStartedAt > CONFIG.ATTACK_TIMEOUT then
             blacklistTarget(string.format("attack timeout %.0fs", CONFIG.ATTACK_TIMEOUT))
             return
@@ -1627,12 +1451,11 @@ local function pumpkinFarmStart()
     pumpkinFarm.lastRespawnAt = nil
     pumpkinFarm.lastAttackTime = 0
     pumpkinFarm.lastHumanoid = nil
-    pumpkinFarm.lastWaterCheck = 0
     pumpkinFarm.weaponEquippedFor = nil
     pumpkinFarm.lastDistLog = 0
     resetStuckTracking()
     noclipParts = {}
-    addLog("PUMPKIN", string.format("Started. Fly %d/s, weapon %s.", pumpkinFarm.speed, pumpkinFarm.weaponCategory))
+    addLog("PUMPKIN", string.format("Started. %d/s, %s.", pumpkinFarm.speed, pumpkinFarm.weaponCategory))
     pumpkinFarm.thread = task.spawn(function()
         while pumpkinFarm.running do
             pcall(pumpkinFarmTick)
@@ -1640,13 +1463,9 @@ local function pumpkinFarmStart()
         end
     end)
 end
-
 local function stopPumpkinFarm()
     pumpkinFarm.running = false
-    if pumpkinFarm.thread then
-        pcall(function() task.cancel(pumpkinFarm.thread) end)
-        pumpkinFarm.thread = nil
-    end
+    if pumpkinFarm.thread then pcall(function() task.cancel(pumpkinFarm.thread) end); pumpkinFarm.thread = nil end
     pumpkinFarm.flyTarget = nil
     pumpkinFarm.currentPumpkin = nil
     pumpkinFarm.currentRoot = nil
@@ -1655,9 +1474,7 @@ local function stopPumpkinFarm()
     pumpkinFarm.weaponEquippedFor = nil
     resetStuckTracking()
     for part in pairs(noclipParts) do
-        pcall(function()
-            if part.Parent and part:IsA("BasePart") then part.CanCollide = true end
-        end)
+        pcall(function() if part.Parent and part:IsA("BasePart") then part.CanCollide = true end end)
     end
     noclipParts = {}
     local char = player.Character
@@ -1667,15 +1484,9 @@ local function stopPumpkinFarm()
     addLog("PUMPKIN", "Stopped.")
 end
 
--- =========================================================
 -- AUTO TRICK OR TREAT
--- =========================================================
 local trickOrTreat = { running = false, thread = nil, delay = 1.5 }
-
-local function setToTStatus(text)
-    setFeatureStatus("treat", text)
-end
-
+local function setToTStatus(text) setFeatureStatus("treat", text) end
 local function findTrickOrTreatDoors()
     local doors = {}
     local roots = {}
@@ -1684,7 +1495,7 @@ local function findTrickOrTreatDoors()
         if r then table.insert(roots, r) end
     end
     for _, child in ipairs(Workspace:GetChildren()) do
-        if child:IsA("Model") and (child.Name:lower():find("door", 1, true) or child.Name:lower():find("trick", 1, true)) then
+        if child:IsA("Model") and (child.Name:lower():find("door",1,true) or child.Name:lower():find("trick",1,true)) then
             table.insert(doors, child)
         end
     end
@@ -1692,7 +1503,7 @@ local function findTrickOrTreatDoors()
         local ok, desc = pcall(function() return root:GetDescendants() end)
         if ok then
             for _, d in ipairs(desc) do
-                if d:IsA("Model") and (d.Name:lower():find("door", 1, true) or d.Name:lower():find("trick", 1, true) or d.Name:lower():find("treat", 1, true)) then
+                if d:IsA("Model") and (d.Name:lower():find("door",1,true) or d.Name:lower():find("trick",1,true) or d.Name:lower():find("treat",1,true)) then
                     table.insert(doors, d)
                 end
             end
@@ -1700,17 +1511,12 @@ local function findTrickOrTreatDoors()
     end
     return doors
 end
-
 local function stopTrickOrTreat()
     trickOrTreat.running = false
-    if trickOrTreat.thread then
-        pcall(function() task.cancel(trickOrTreat.thread) end)
-        trickOrTreat.thread = nil
-    end
+    if trickOrTreat.thread then pcall(function() task.cancel(trickOrTreat.thread) end); trickOrTreat.thread = nil end
     setToTStatus("Stopped")
     addLog("TREAT", "Stopped.")
 end
-
 local function trickOrTreatStart()
     if trickOrTreat.running then return end
     trickOrTreat.running = true
@@ -1722,22 +1528,10 @@ local function trickOrTreatStart()
                 local char = player.Character
                 local hrp = char and char:FindFirstChild("HumanoidRootPart")
                 local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if not hrp or not hum then
-                    setToTStatus("Error: no character")
-                    task.wait(1)
-                    return
-                end
-                if hum.PlatformStand then
-                    setToTStatus("Waiting: movement disabled by other feature")
-                    task.wait(1)
-                    return
-                end
+                if not hrp or not hum then setToTStatus("Error: no character"); task.wait(1); return end
+                if hum.PlatformStand then setToTStatus("Waiting: movement disabled"); task.wait(1); return end
                 local doors = findTrickOrTreatDoors()
-                if #doors == 0 then
-                    setToTStatus("Searching (no doors found)")
-                    task.wait(2)
-                    return
-                end
+                if #doors == 0 then setToTStatus("Searching (no doors)"); task.wait(2); return end
                 local best, bestDist = nil, math.huge
                 for _, door in ipairs(doors) do
                     local r = door:FindFirstChild("RootPart") or door:FindFirstChild("HumanoidRootPart") or door.PrimaryPart
@@ -1746,13 +1540,9 @@ local function trickOrTreatStart()
                         if d < bestDist then best, bestDist = door, d end
                     end
                 end
-                if not best then
-                    setToTStatus("Searching (no reachable doors)")
-                    task.wait(2)
-                    return
-                end
+                if not best then setToTStatus("Searching (unreachable)"); task.wait(2); return end
                 if bestDist <= 10 then
-                    setToTStatus("Interaction attempted: " .. best.Name)
+                    setToTStatus("Interaction: " .. best.Name)
                     local prompt = best:FindFirstChildWhichIsA("ProximityPrompt", true)
                     if prompt then
                         pcall(function() prompt:InputHoldBegin() end)
@@ -1766,61 +1556,51 @@ local function trickOrTreatStart()
                             addLog("TREAT", "OnTalkToNPC on " .. best.Name)
                         else
                             addLog("TREAT", "No interaction method for " .. best.Name)
-                            setToTStatus("Error: no interaction method")
+                            setToTStatus("Error: no method")
                         end
                     end
                     lastTotInteractionAt = os.clock()
                     setToTStatus("Waiting (cooldown)")
                     task.wait(trickOrTreat.delay)
                 else
-                    setToTStatus(string.format("Target found: %s (%.0f studs)", best.Name, bestDist))
+                    setToTStatus(string.format("Target: %s (%.0f)", best.Name, bestDist))
                     local r = best:FindFirstChild("RootPart") or best:FindFirstChild("HumanoidRootPart") or best.PrimaryPart
                     if r then pcall(function() hum:MoveTo(r.Position) end) end
                 end
             end)
-            if not ok then
-                setToTStatus("Error: " .. tostring(err))
-                addLog("ERROR", "ToT tick: " .. tostring(err))
-            end
+            if not ok then setToTStatus("Error: " .. tostring(err)); addLog("ERROR", "ToT: " .. tostring(err)) end
             task.wait(0.5)
         end
     end)
 end
 
--- =========================================================
--- EVENT KEYWORD OBSERVER
--- =========================================================
-local eventObserver = { running = false, thread = nil, connections = {}, knownObjects = {} }
-local EVENT_KEYWORDS = { "trick", "treat", "dapper", "cursed", "seed", "spooky", "jack", "pumpkin", "halloween" }
+-- EVENT OBSERVER
+local eventObserver = { running = false, thread = nil, connections = {}, known = {} }
+local EVENT_KEYWORDS = { "trick","treat","dapper","cursed","seed","spooky","jack","pumpkin","halloween" }
 local function isEventObject(inst)
     local n = inst.Name:lower()
-    for _, k in ipairs(EVENT_KEYWORDS) do if n:find(k, 1, true) then return true end end
+    for _, k in ipairs(EVENT_KEYWORDS) do if n:find(k,1,true) then return true end end
     return false
 end
 local function handleAdded(inst)
     if not eventObserver.running then return end
-    if isEventObject(inst) and not eventObserver.knownObjects[inst] then
-        eventObserver.knownObjects[inst] = true
-    end
+    if isEventObject(inst) and not eventObserver.known[inst] then eventObserver.known[inst] = true end
 end
 local function handleRemoved(inst)
-    if eventObserver.knownObjects[inst] then eventObserver.knownObjects[inst] = nil end
+    if eventObserver.known[inst] then eventObserver.known[inst] = nil end
 end
 local function stopEventObserver()
     eventObserver.running = false
     for _, c in ipairs(eventObserver.connections) do pcall(function() c:Disconnect() end) end
     eventObserver.connections = {}
-    eventObserver.knownObjects = {}
-    if eventObserver.thread then
-        pcall(function() task.cancel(eventObserver.thread) end)
-        eventObserver.thread = nil
-    end
+    eventObserver.known = {}
+    if eventObserver.thread then pcall(function() task.cancel(eventObserver.thread) end); eventObserver.thread = nil end
     addLog("EVENT", "Stopped.")
 end
 local function eventObserverStart()
     if eventObserver.running then return end
     eventObserver.running = true
-    eventObserver.knownObjects = {}
+    eventObserver.known = {}
     eventObserver.connections = {}
     addLog("EVENT", "Started (event-driven).")
     local containers = {}
@@ -1828,9 +1608,7 @@ local function eventObserverStart()
         local c = Workspace:FindFirstChild(name)
         if c then table.insert(containers, c) end
     end
-    if #containers == 0 then
-        setFeatureStatus("events", "no containers")
-        addLog("EVENT", "No known containers.")
+    if #containers == 0 then setFeatureStatus("events", "no containers"); addLog("EVENT", "No containers.")
     else
         for _, c in ipairs(containers) do
             table.insert(eventObserver.connections, c.DescendantAdded:Connect(handleAdded))
@@ -1839,7 +1617,7 @@ local function eventObserverStart()
         for _, c in ipairs(containers) do
             local ok, desc = pcall(function() return c:GetDescendants() end)
             if ok then
-                for _, d in ipairs(desc) do if isEventObject(d) then eventObserver.knownObjects[d] = true end end
+                for _, d in ipairs(desc) do if isEventObject(d) then eventObserver.known[d] = true end end
             end
         end
     end
@@ -1847,38 +1625,30 @@ local function eventObserverStart()
         while eventObserver.running do
             task.wait(CONFIG.EVENT_SCAN_INTERVAL)
             local n = 0
-            for _ in pairs(eventObserver.knownObjects) do n = n + 1 end
+            for _ in pairs(eventObserver.known) do n = n + 1 end
             setFeatureStatus("events", tostring(n) .. " tracked")
         end
     end)
 end
 
--- =========================================================
 -- MATERIAL SCANNER
--- =========================================================
-local MATERIAL_KEYWORDS = { "candy", "corn", "pumpkin", "bit", "seed", "treat", "halloween", "spooky", "soul", "bone" }
-local function hasMaterialKeyword(name)
+local MATERIAL_KEYWORDS = { "candy","corn","pumpkin","bit","seed","treat","halloween","spooky","soul","bone" }
+local function hasMatKeyword(name)
     local s = tostring(name):lower()
-    for _, k in ipairs(MATERIAL_KEYWORDS) do if s:find(k, 1, true) then return true end end
+    for _, k in ipairs(MATERIAL_KEYWORDS) do if s:find(k,1,true) then return true end end
     return false
 end
 local function collectMaterials()
     local out = {}
-    local function add(name, value)
-        if hasMaterialKeyword(name) and type(value) == "number" then out[name] = value end
-    end
+    local function add(n, v) if hasMatKeyword(n) and type(v) == "number" then out[n] = v end end
     for k, v in pairs(player:GetAttributes()) do add("attr." .. tostring(k), v) end
     local ls = player:FindFirstChild("leaderstats")
-    if ls then
-        for _, c in ipairs(ls:GetChildren()) do
-            if c:IsA("ValueBase") then add("leaderstats." .. c.Name, c.Value) end
-        end
-    end
+    if ls then for _, c in ipairs(ls:GetChildren()) do if c:IsA("ValueBase") then add("leaderstats." .. c.Name, c.Value) end end end
     for _, cont in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
         if cont then
-            for _, child in ipairs(cont:GetChildren()) do
-                if child:IsA("Tool") and hasMaterialKeyword(child.Name) then
-                    local key = "tool." .. child.Name
+            for _, ch in ipairs(cont:GetChildren()) do
+                if ch:IsA("Tool") and hasMatKeyword(ch.Name) then
+                    local key = "tool." .. ch.Name
                     out[key] = (out[key] or 0) + 1
                 end
             end
@@ -1886,57 +1656,66 @@ local function collectMaterials()
     end
     return out
 end
-local function materialString(tbl)
-    local keys = {}
-    for k in pairs(tbl) do table.insert(keys, k) end
-    table.sort(keys)
-    local parts = {}
-    for _, k in ipairs(keys) do table.insert(parts, k .. "=" .. tostring(tbl[k])) end
-    return table.concat(parts, ", ")
+local function matString(t)
+    local ks = {}
+    for k in pairs(t) do table.insert(ks, k) end
+    table.sort(ks)
+    local p = {}
+    for _, k in ipairs(ks) do table.insert(p, k .. "=" .. tostring(t[k])) end
+    return table.concat(p, ", ")
 end
-local materialSnapshot = nil
-local function materialStart() materialSnapshot = nil; addLog("MATERIAL", "Started.") end
-local function materialTick()
-    local snap = collectMaterials()
-    local str = materialString(snap)
-    if not materialSnapshot then
-        addLog("MATERIAL", "Initial: " .. (str ~= "" and str or "none"))
-        materialSnapshot = snap
-    elseif materialString(materialSnapshot) ~= str then
-        addLog("MATERIAL", "Changes: " .. (str ~= "" and str or "none"))
-        materialSnapshot = snap
-    end
+local matSnapshot = nil
+local function matStart() matSnapshot = nil; addLog("MATERIAL", "Started.") end
+local function matTick()
+    local s = collectMaterials()
+    local str = matString(s)
+    if not matSnapshot then addLog("MATERIAL", "Initial: " .. (str ~= "" and str or "none")); matSnapshot = s
+    elseif matString(matSnapshot) ~= str then addLog("MATERIAL", "Change: " .. (str ~= "" and str or "none")); matSnapshot = s end
     local n = 0
-    for _ in pairs(snap) do n = n + 1 end
+    for _ in pairs(s) do n = n + 1 end
     setFeatureStatus("materials", tostring(n) .. " value(s)")
 end
 
--- =========================================================
--- GACHA MONITOR + TIMER
--- =========================================================
+-- GACHA
 local gachaLastPresent = nil
+local function parseGachaResponse(res)
+    if type(res) ~= "table" then return end
+    local found = {}
+    local function walk(t)
+        for k, v in pairs(t) do
+            if type(v) == "number" then
+                local kl = tostring(k):lower()
+                if kl:find("cool") or kl:find("next") or kl:find("reset") or kl:find("timeleft") then
+                    table.insert(found, { k = tostring(k), v = v })
+                end
+            elseif type(v) == "table" then walk(v) end
+        end
+    end
+    pcall(function() walk(res) end)
+    if #found > 0 and found[1].v > 0 and found[1].v < 86400 then
+        gacha.cooldownSeconds = found[1].v
+        addLog("GACHA", "Parsed cooldown: " .. found[1].v .. "s (from " .. found[1].k .. ")")
+    end
+end
 local function invokeGachaContext(context)
     local rf = getGachaRF()
-    if not rf then
-        addLog("GACHA", "RF/GachaNetworkRF missing. Cannot call " .. tostring(context))
-        return false
-    end
+    if not rf then addLog("GACHA", "RF missing."); return false end
     local payload = { Context = context, BoxName = CONFIG.GACHA_BOX }
     local ok, res = pcall(function()
         if rf:IsA("RemoteFunction") then return rf:InvokeServer(payload)
         elseif rf:IsA("RemoteEvent") then rf:FireServer(payload); return "fired"
-        else error("Unsupported remote class: " .. rf.ClassName) end
+        else error("unsupported") end
     end)
     if ok then
         addLog("GACHA", tostring(context) .. " -> " .. fmt(res))
         if context == "GetPityData" or context == "Check" then parseGachaResponse(res) end
         return true, res
     end
-    addLog("ERROR", "Gacha " .. tostring(context) .. " failed: " .. tostring(res))
+    addLog("ERROR", "Gacha " .. tostring(context) .. ": " .. tostring(res))
     return false
 end
 local function probeGacha()
-    addLog("GACHA", "Probing (GetPityData, Check).")
+    addLog("GACHA", "Probing.")
     invokeGachaContext("GetPityData")
     task.wait(0.3)
     invokeGachaContext("Check")
@@ -1955,29 +1734,25 @@ local purchaseConfirmUntil = 0
 local function requestGachaPurchase()
     if os.clock() < purchaseConfirmUntil then
         purchaseConfirmUntil = 0
-        addLog("GACHA", "Manual Purchase. Server validates.")
+        addLog("GACHA", "Manual Purchase fired.")
         gacha.lastPurchaseAttemptAt = os.clock()
-        local ok = invokeGachaContext("Purchase")
-        if ok then
-            addLog("GACHA", "Purchase fired. Cooldown duration unverified; timer shows time-since-roll.")
-        end
+        gacha.pendingRollWindowUntil = os.clock() + CONFIG.ROLL_WINDOW_SECONDS
+        invokeGachaContext("Purchase")
         updateCountdownLabels()
     else
         purchaseConfirmUntil = os.clock() + 5
-        addLog("WARN", "Tap Buy Gacha again within 5s to confirm (may spend 500 Candy Corn).")
+        addLog("WARN", "Tap Buy Gacha again within 5s (may spend 500 Candy Corn).")
     end
 end
 
--- =========================================================
 -- FRUIT OBSERVER
--- =========================================================
 local fruitLastString = nil
 local function collectFruits()
     local out = {}
     for _, cont in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
         if cont then
-            for _, child in ipairs(cont:GetChildren()) do
-                if child:IsA("Tool") then table.insert(out, child.Name) end
+            for _, ch in ipairs(cont:GetChildren()) do
+                if ch:IsA("Tool") then table.insert(out, ch.Name) end
             end
         end
     end
@@ -1989,29 +1764,20 @@ local function fruitTick()
     scanForNewFruits()
     local list = collectFruits()
     local str = table.concat(list, ", ")
-    if fruitLastString ~= str then
-        fruitLastString = str
-    end
+    if fruitLastString ~= str then fruitLastString = str end
     setFeatureStatus("fruits", tostring(#list) .. " tool(s)")
 end
 
--- =========================================================
--- RESPAWN COUNTDOWN
--- =========================================================
-local respawnEndsAt = nil
-local respawnNotified = true
+-- RESPAWN
+local respawnEndsAt, respawnNotified = nil, true
 local function respawnStart() addLog("RESPAWN", "Started.") end
 local function respawnTick()
     if respawnEndsAt then
-        local remain = respawnEndsAt - os.clock()
-        if remain > 0 then
-            setFeatureStatus("respawn", string.format("%02d:%02d", math.floor(remain/60), math.floor(remain%60)))
+        local r = respawnEndsAt - os.clock()
+        if r > 0 then setFeatureStatus("respawn", string.format("%02d:%02d", math.floor(r/60), math.floor(r%60)))
         else
-            if not respawnNotified then
-                addLog("RESPAWN", "Estimate reached.")
-                respawnNotified = true
-            end
-            setFeatureStatus("respawn", "Estimate reached")
+            if not respawnNotified then addLog("RESPAWN", "Reached."); respawnNotified = true end
+            setFeatureStatus("respawn", "Reached")
             respawnEndsAt = nil
         end
     else
@@ -2019,9 +1785,7 @@ local function respawnTick()
     end
 end
 
--- =========================================================
--- DIAGNOSTICS
--- =========================================================
+-- DIAG
 local DIAG_PATHS = {
     { "Remotes", "OnTalkToNPC" },
     { "Modules", "Net", "RF/GachaNetworkRF" },
@@ -2031,158 +1795,111 @@ local DIAG_PATHS = {
     { "Modules", "Net", "RE/RegisterAttack" },
 }
 local diagLast = 0
-local function runDiagnostics(verbose)
+local function runDiag(verbose)
     local present = 0
     for _, path in ipairs(DIAG_PATHS) do
         local obj = findRemotePath(ReplicatedStorage, path)
         local name = table.concat(path, ".")
-        if obj then
-            present = present + 1
-            if verbose then addLog("DIAG", "FOUND " .. name .. " (" .. obj.ClassName .. ")") end
+        if obj then present = present + 1; if verbose then addLog("DIAG", "FOUND " .. name .. " (" .. obj.ClassName .. ")") end
         elseif verbose then addLog("DIAG", "MISSING " .. name) end
     end
     setFeatureStatus("diag", tostring(present) .. "/" .. tostring(#DIAG_PATHS))
 end
-local function diagStart() diagLast = 0; addLog("DIAG", "Started."); runDiagnostics(true) end
-local function diagTick()
-    if os.clock() - diagLast < 15 then return end
-    diagLast = os.clock()
-    runDiagnostics(false)
-end
+local function diagStart() diagLast = 0; addLog("DIAG", "Started."); runDiag(true) end
+local function diagTick() if os.clock() - diagLast < 15 then return end; diagLast = os.clock(); runDiag(false) end
 
--- =========================================================
--- NPC THREAT DETECTION (diagnostic only)
--- =========================================================
-local npcLastIds = {}
-local function npcScanStart()
-    addLog("NPC", "Started. Diagnostic only — no auto-attack. Blox Fruits NPCs are mostly passive.")
-    npcLastIds = {}
-end
-local function npcScanStop()
-    addLog("NPC", "Stopped.")
-    npcLastIds = {}
-end
-local function npcScanTick()
+-- NPC
+local npcKnown = {}
+local function npcStart() addLog("NPC", "Started. Diagnostic only."); npcKnown = {} end
+local function npcStop() addLog("NPC", "Stopped."); npcKnown = {} end
+local function npcTick()
     if os.clock() - npcLastScan < CONFIG.NPC_SCAN_INTERVAL then return end
     npcLastScan = os.clock()
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then setFeatureStatus("npc", "no character"); return end
-
-    local roots = {}
-    local npcsFolder = Workspace:FindFirstChild("NPCs")
-    if npcsFolder then table.insert(roots, npcsFolder) end
-
     local found = {}
-    for _, root in ipairs(roots) do
-        local ok, desc = pcall(function() return root:GetDescendants() end)
+    local folder = Workspace:FindFirstChild("NPCs")
+    if folder then
+        local ok, desc = pcall(function() return folder:GetDescendants() end)
         if ok then
             for _, d in ipairs(desc) do
-                if d:IsA("Model") then
-                    local h = d:FindFirstChildOfClass("Humanoid")
+                if d:IsA("Model") and d:FindFirstChildOfClass("Humanoid") then
                     local r = d:FindFirstChild("HumanoidRootPart") or d.PrimaryPart
-                    if h and r and r:IsA("BasePart") then
+                    if r and r:IsA("BasePart") then
                         local dist = (r.Position - hrp.Position).Magnitude
-                        if dist <= CONFIG.NPC_SCAN_RADIUS then
-                            found[d] = { name = d.Name, dist = dist }
-                        end
+                        if dist <= CONFIG.NPC_SCAN_RADIUS then found[d] = { name = d.Name, dist = dist } end
                     end
                 end
             end
         end
     end
     for obj, info in pairs(found) do
-        if not npcLastIds[obj] then
-            npcLastIds[obj] = true
-            addLog("NPC", string.format("%s @ %.0f studs", info.name, info.dist))
-        end
+        if not npcKnown[obj] then npcKnown[obj] = true; addLog("NPC", info.name .. " @ " .. string.format("%.0f", info.dist)) end
     end
-    for obj in pairs(npcLastIds) do
-        if not found[obj] then npcLastIds[obj] = nil end
-    end
+    for obj in pairs(npcKnown) do if not found[obj] then npcKnown[obj] = nil end end
     local n = 0
     for _ in pairs(found) do n = n + 1 end
     setFeatureStatus("npc", tostring(n) .. " nearby")
 end
 
--- =========================================================
--- REGISTER FEATURES
--- =========================================================
-addFeature("pumpkin", "Auto Pumpkin Farm", "Nearest-target + fly + water-safe + noclip + weapon select.", pumpkinFarmStart, stopPumpkinFarm, nil)
-addFeature("treat", "Auto Trick or Treat", "Best-effort. Reports state per cycle.", trickOrTreatStart, stopTrickOrTreat, nil)
+-- REGISTER
+addFeature("pumpkin", "Auto Pumpkin Farm", "Nearest + fly + water-safe + noclip.", pumpkinFarmStart, stopPumpkinFarm, nil)
+addFeature("treat", "Auto Trick or Treat", "Best-effort door search + interaction.", trickOrTreatStart, stopTrickOrTreat, nil)
 addFeature("events", "Event Keyword Observer", "Event-driven.", eventObserverStart, stopEventObserver, nil)
-addFeature("materials", "Material Scanner", "Attributes, leaderstats, tools.", materialStart, nil, materialTick)
-addFeature("gacha", "Halloween Gacha Monitor", "Presence + probes. Sets timer.", gachaStart, nil, gachaTick, "Check", probeGacha)
-addFeature("fruits", "Fruit Inventory Observer", "Tracks fruit roll / storage / loss.", fruitStart, nil, fruitTick)
-addFeature("respawn", "Respawn Countdown", "Local 690s estimate.", respawnStart, nil, respawnTick)
-addFeature("npc", "NPC Threat Detection", "Diagnostic only — lists nearby NPCs in radius " .. CONFIG.NPC_SCAN_RADIUS, npcScanStart, npcScanStop, npcScanTick)
-addFeature("diag", "Remote Diagnostics", "Reports captured remotes.", diagStart, nil, diagTick)
+addFeature("materials", "Material Scanner", "Attributes, leaderstats, tools.", matStart, nil, matTick)
+addFeature("gacha", "Halloween Gacha Monitor", "Presence + probes + timer.", gachaStart, nil, gachaTick, "Check", probeGacha)
+addFeature("fruits", "Fruit Inventory Observer", "Tracks gacha roll / storage / loss.", fruitStart, nil, fruitTick)
+addFeature("respawn", "Respawn Countdown", "690s local estimate.", respawnStart, nil, respawnTick)
+addFeature("npc", "NPC Threat Detection", "Diagnostic only, radius " .. CONFIG.NPC_SCAN_RADIUS, npcStart, npcStop, npcTick)
+addFeature("diag", "Remote Diagnostics", "Captured remotes.", diagStart, nil, diagTick)
 
--- =========================================================
--- MAIN FEATURE LOOP
--- =========================================================
+-- MAIN LOOP
 task.spawn(function()
     while screenGui and screenGui.Parent do
         for _, id in ipairs(featureOrder) do
             local f = features[id]
             if f and f.running and f.onTick then
                 local ok, err = pcall(f.onTick)
-                if not ok then
-                    addLog("ERROR", f.name .. " tick failed: " .. tostring(err))
-                    setFeatureStatus(id, "error")
-                end
+                if not ok then addLog("ERROR", f.name .. ": " .. tostring(err)); setFeatureStatus(id, "error") end
             end
         end
-        -- Stats sampling (candy corn, fruit scans even if feature off)
-        pcall(function()
-            checkCandyCornChange()
-            scanForNewFruits()
-        end)
-        -- Update stats tab timers every ~1s
-        pcall(function()
-            if activeTab == "stats" then refreshStatsTab() end
-        end)
+        pcall(function() checkCandyCornChange(); scanForNewFruits() end)
+        pcall(function() updateCountdownLabels() end)
+        pcall(function() if activeTab == "stats" then refreshStatsTab() end end)
         task.wait(CONFIG.FEATURE_TICK)
     end
 end)
 
--- =========================================================
 -- UI ACTIONS
--- =========================================================
 startAllBtn.MouseButton1Click:Connect(function()
     addLog("FEATURE", "Start All.")
     for _, id in ipairs(featureOrder) do setFeatureRunning(id, true, true) end
     updateSummary()
 end)
-
 stopAllBtn.MouseButton1Click:Connect(function()
     addLog("FEATURE", "Stop All.")
     for _, id in ipairs(featureOrder) do setFeatureRunning(id, false, true) end
     updateSummary()
 end)
-
 loggingBtn.MouseButton1Click:Connect(function()
     logEnabled = not logEnabled
     loggingBtn.Text = "Logging: " .. (logEnabled and "ON" or "OFF")
     if logEnabled then addLog("SYS", "Logging enabled.") end
 end)
-
 clearBtn.MouseButton1Click:Connect(function()
     logLines = {}
     if logLabel then logLabel.Text = "" end
     if logScroll then logScroll.CanvasSize = UDim2.new(0, 0, 0, 0) end
     updateSummary()
 end)
-
 copyBtn.MouseButton1Click:Connect(function()
     local ok, err = pcall(function() setclipboard(table.concat(logLines, "\n")) end)
-    if ok then addLog("SYS", "Logs copied.") else addLog("ERROR", "Copy failed: " .. tostring(err)) end
+    if ok then addLog("SYS", "Copied.") else addLog("ERROR", "Copy failed: " .. tostring(err)) end
 end)
-
 buyGachaBtn.MouseButton1Click:Connect(requestGachaPurchase)
 
-local minimized = false
-local savedSize = main.Size
+local minimized, savedSize = false, main.Size
 minBtn.MouseButton1Click:Connect(function()
     minimized = not minimized
     if minimized then
@@ -2195,49 +1912,37 @@ minBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- X-close: stop all features + destroy GUI (v7 fix preserved)
+-- X CLOSE: stop all + destroy
 closeBtn.MouseButton1Click:Connect(function()
-    for _, id in ipairs(featureOrder) do
-        pcall(function() setFeatureRunning(id, false, true) end)
-    end
+    for _, id in ipairs(featureOrder) do pcall(function() setFeatureRunning(id, false, true) end) end
     task.wait(0.1)
     if screenGui then screenGui:Destroy() end
 end)
 
--- Dragging
-local dragging = false
-local dragStart = nil
-local startPos = nil
+-- DRAGGING
+local dragging, dragStart, startPos = false, nil, nil
 header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = main.Position
+        dragging = true; dragStart = input.Position; startPos = main.Position
     end
 end)
 UserInputService.InputChanged:Connect(function(input)
     if not dragging then return end
     if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-        local delta = input.Position - dragStart
-        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end
 end)
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-    end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
 end)
 
--- Initialize stats
+-- INIT
 pcall(checkCandyCornChange)
+pcall(seedExistingFruits)
 refreshStatsTab()
-
-addLog("SYS", "ELITES HALLOWEEN FARM v8 loaded.")
-addLog("SYS", "Nearest-target scan now runs every tick, no 5s wait. Stats tab added.")
-if storeHookActive then
-    addLog("SYS", "Store hook active: fruit storage can be confirmed.")
-else
-    addLog("SYS", "Store hook inactive: fruit storage is inferred (may be uncertain).")
-end
+addLog("SYS", "v9 loaded. Fruit history now gacha-only. Timer scans game GUI.")
+if storeHookActive then addLog("SYS", "Store hook active.")
+else addLog("SYS", "Store hook inactive — storage is inferred.") end
 updateSummary()
-warn("[EHF] v8 GUI loaded successfully.")
+warn("[EHF] v9 GUI loaded successfully.")

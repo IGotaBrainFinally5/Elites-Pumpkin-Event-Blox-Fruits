@@ -1,14 +1,18 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — v6 (Flying + Noclip + Better Detection + Speed Slider)
+-- ELITES HALLOWEEN FARM — v7 (Speed 400 / Water-safe Fly / Weapon Select / Stuck Recovery / ToT Diagnostics)
 -- Delta Executor / Android / live Blox Fruits
--- Preserves v5 GUI + features. Changes:
---   * Pumpkin farm now FLIES via CFrame interpolation at configurable studs/s
---   * Auto-noclip tied to farm lifecycle (enable on start, disable on stop)
---   * Detection: immediately retarget on pumpkin loss; only WAIT if no pumpkins map-wide
---   * New "Tween Speed" slider in toolbar (50-250, default 200)
---   * Single RenderStepped connection drives both fly + noclip (no duplicates)
+-- Preserves v6 GUI structure, existing features, movement interpolation.
+-- Changes:
+--   * Tween Speed 50–400, default 250
+--   * Water-aware fly target: downward raycast finds water surface, clamps Y
+--     so destination is >= MIN_HEIGHT_ABOVE_WATER above water (and slightly above ground)
+--     In-flight safety raycast every WATER_CHECK_INTERVAL if somehow submerged
+--   * Weapon selector (Melee / Sword) with heuristic equip
+--   * Stuck-target detection: distance-progress timer + Y-oscillation counter
+--     Blacklist duration re-tries bad targets after cooldown
+--   * Auto Trick or Treat: explicit status string transitions
 
-print("[EHF] v6 starting...")
+print("[EHF] v7 starting...")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -77,10 +81,17 @@ local CONFIG = {
     EVENT_SCAN_INTERVAL = 10,
     ATTACK_COOLDOWN = 0.35,
     TOUCH_DISTANCE = 8,
-    FLY_SPEED_DEFAULT = 200,
+    FLY_SPEED_DEFAULT = 250,
     FLY_SPEED_MIN = 50,
-    FLY_SPEED_MAX = 250,
+    FLY_SPEED_MAX = 400,
     WAITING_RESCAN = 5,
+    MIN_HEIGHT_ABOVE_WATER = 6,
+    WATER_CHECK_INTERVAL = 0.5,
+    STUCK_TIMEOUT = 3.0,
+    OSCILLATION_THRESHOLD = 8,
+    BLACKLIST_DURATION = 30,
+    PROGRESS_THRESHOLD = 0.5,
+    STUCK_TICK_DT = 0.1,
 }
 
 local THEME = {
@@ -94,6 +105,7 @@ local THEME = {
     Green = Color3.fromRGB(90, 230, 140),
     Red = Color3.fromRGB(255, 90, 110),
     Danger = Color3.fromRGB(120, 40, 60),
+    Selected = Color3.fromRGB(120, 60, 180),
 }
 
 local FONT_REG = Enum.Font.Arial
@@ -206,7 +218,7 @@ local function makeButton(parent, text, size, pos)
 end
 
 -- =========================================================
--- PUMPKIN FARM STATE (declared before UI so slider can touch it)
+-- PUMPKIN FARM STATE (declared before UI so slider/weapon buttons can touch it)
 -- =========================================================
 local pumpkinFarm = {
     running = false,
@@ -215,11 +227,21 @@ local pumpkinFarm = {
     currentPumpkin = nil,
     currentRoot = nil,
     flyTarget = nil,
+    targetWaterY = nil,
     speed = CONFIG.FLY_SPEED_DEFAULT,
+    weaponCategory = "Melee",
     lastAttackTime = 0,
     lastRespawnAt = nil,
     lastWaitScanTime = 0,
     lastHumanoid = nil,
+    lastWaterCheck = 0,
+    stuckTime = 0,
+    lastDistance = nil,
+    lastY = nil,
+    lastDy = nil,
+    oscillationCount = 0,
+    blacklist = {},
+    weaponEquippedFor = nil,
 }
 
 local noclipParts = {}
@@ -235,6 +257,26 @@ local featureScroll
 local startAllBtn, stopAllBtn, loggingBtn, clearBtn, copyBtn, buyGachaBtn
 local minBtn, closeBtn
 local speedLabel, speedFill, speedThumb
+local weaponMeleeBtn, weaponSwordBtn, weaponLabel
+
+local function refreshWeaponButtons()
+    if not weaponMeleeBtn or not weaponSwordBtn then return end
+    if pumpkinFarm.weaponCategory == "Melee" then
+        weaponMeleeBtn.BackgroundColor3 = THEME.Selected
+        weaponSwordBtn.BackgroundColor3 = THEME.Button
+    else
+        weaponMeleeBtn.BackgroundColor3 = THEME.Button
+        weaponSwordBtn.BackgroundColor3 = THEME.Selected
+    end
+end
+
+local function setWeaponCategory(cat)
+    pumpkinFarm.weaponCategory = cat
+    pumpkinFarm.weaponEquippedFor = nil -- force re-equip on next attack
+    refreshWeaponButtons()
+    addLog("WEAPON", "Category set to " .. cat)
+    if updateSummary then updateSummary() end
+end
 
 local function buildUI()
     local viewport
@@ -245,7 +287,7 @@ local function buildUI()
     end
 
     local mainW = math.clamp(viewport.X - 24, 320, 420)
-    local mainH = math.clamp(viewport.Y - 60, 400, 560)
+    local mainH = math.clamp(viewport.Y - 60, 420, 580)
     warn(string.format("[EHF] Viewport=%dx%d main=%dx%d", viewport.X, viewport.Y, mainW, mainH))
 
     screenGui = Instance.new("ScreenGui")
@@ -298,7 +340,7 @@ local function buildUI()
 
     local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
     title.ZIndex = 4
-    local subtitle = makeLabel(header, "Fly-farm + best-effort attack — no fake rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+    local subtitle = makeLabel(header, "Fly-farm + water-safe + weapon select", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
     subtitle.ZIndex = 4
 
     minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
@@ -313,7 +355,7 @@ local function buildUI()
     local contentBottom = mainH - 6
     local contentHeight = contentBottom - contentTop
 
-    local toolbarH = 96
+    local toolbarH = 128
     local toolbar = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, toolbarH), UDim2.fromOffset(contentLeft, contentTop), "Toolbar")
     toolbar.ZIndex = 3
 
@@ -396,6 +438,7 @@ local function buildUI()
         speedFill.Size = UDim2.new(rel, 0, 1, 0)
         speedThumb.Position = UDim2.new(rel, 0, 0.5, 0)
         speedLabel.Text = "Tween Speed: " .. value
+        if updateSummary then updateSummary() end
     end
 
     local speedDragging = false
@@ -417,7 +460,6 @@ local function buildUI()
         end
     end)
 
-    -- Initialize to default
     do
         local rel = (CONFIG.FLY_SPEED_DEFAULT - CONFIG.FLY_SPEED_MIN) / (CONFIG.FLY_SPEED_MAX - CONFIG.FLY_SPEED_MIN)
         speedFill.Size = UDim2.new(rel, 0, 1, 0)
@@ -425,11 +467,40 @@ local function buildUI()
         speedLabel.Text = "Tween Speed: " .. CONFIG.FLY_SPEED_DEFAULT
     end
 
+    -- Row 4: Weapon selector
+    local weaponRow = Instance.new("Frame")
+    weaponRow.Name = "WeaponRow"
+    weaponRow.BackgroundTransparency = 1
+    weaponRow.Position = UDim2.fromOffset(4, 96)
+    weaponRow.Size = UDim2.new(1, -8, 0, 26)
+    weaponRow.ZIndex = 4
+    weaponRow.Parent = toolbar
+
+    weaponLabel = makeLabel(weaponRow, "Weapon:", UDim2.fromOffset(60, 26), UDim2.fromOffset(0, 0), 11, THEME.Text, true)
+    weaponLabel.TextYAlignment = Enum.TextYAlignment.Center
+    weaponLabel.ZIndex = 5
+
+    weaponMeleeBtn = makeButton(weaponRow, "Melee", UDim2.fromOffset(80, 26), UDim2.fromOffset(58, 0))
+    weaponMeleeBtn.TextSize = 12
+    weaponMeleeBtn.ZIndex = 5
+    weaponMeleeBtn.MouseButton1Click:Connect(function()
+        setWeaponCategory("Melee")
+    end)
+
+    weaponSwordBtn = makeButton(weaponRow, "Sword", UDim2.fromOffset(80, 26), UDim2.fromOffset(142, 0))
+    weaponSwordBtn.TextSize = 12
+    weaponSwordBtn.ZIndex = 5
+    weaponSwordBtn.MouseButton1Click:Connect(function()
+        setWeaponCategory("Sword")
+    end)
+
+    refreshWeaponButtons()
+
     local featureY = contentTop + toolbarH + 6
     local summaryH = 50
-    local logMinH = 80
+    local logMinH = 60
     local featureH = contentHeight - toolbarH - 6 - summaryH - logMinH - 12
-    if featureH < 100 then featureH = 100 end
+    if featureH < 60 then featureH = 60 end
     local summaryY = featureY + featureH + 6
     local logY = summaryY + summaryH + 6
     local logH = contentBottom - logY
@@ -528,7 +599,10 @@ updateSummary = function()
         if f and f.running then running = running + 1 end
     end
     if summaryStatus then
-        summaryStatus.Text = string.format("%d feature(s) running. Log lines: %d. Speed: %d studs/s.", running, #logLines, pumpkinFarm.speed)
+        summaryStatus.Text = string.format(
+            "%d running · %d lines · %d/s · %s",
+            running, #logLines, pumpkinFarm.speed, pumpkinFarm.weaponCategory
+        )
     end
 end
 
@@ -651,7 +725,125 @@ local function getRegisterHit()
 end
 
 -- =========================================================
--- PUMPKIN DETECTION (map-wide via PumpkinHunt)
+-- WATER / SAFE-Y HELPERS
+-- =========================================================
+-- Downward raycast at (x, z). Returns waterY if hit is water/terrain-water or a part named water/ocean.
+-- Returns nil if ray missed everything.
+local function getWaterHeightAt(x, z)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local char = player.Character
+    if char then params.FilterDescendantsInstances = { char } end
+    params.IgnoreWater = false
+    params.RespectCanCollide = false
+
+    local origin = Vector3.new(x, 2000, z)
+    local dir = Vector3.new(0, -4000, 0)
+    local ok, result = pcall(function() return Workspace:Raycast(origin, dir, params) end)
+    if not ok or not result then return nil end
+
+    local inst = result.Instance
+    local mat = result.Material
+    local isWater = (mat == Enum.Material.Water)
+    if not isWater and inst then
+        local n = inst.Name:lower()
+        if n:find("water", 1, true) or n:find("ocean", 1, true) then
+            isWater = true
+        end
+    end
+    if isWater then
+        return result.Position.Y
+    end
+    -- Return ground Y so caller can still avoid clipping into terrain
+    return nil, result.Position.Y
+end
+
+-- Compute a safe destination vector (X,Z unchanged, Y clamped above water/ground)
+local function computeSafeFlyTarget(targetPos)
+    local waterY, groundY = getWaterHeightAt(targetPos.X, targetPos.Z)
+    local safeY = targetPos.Y
+
+    if waterY then
+        local minY = waterY + CONFIG.MIN_HEIGHT_ABOVE_WATER
+        if safeY < minY then safeY = minY end
+    elseif groundY then
+        local minY = groundY + 3
+        if safeY < minY then safeY = minY end
+    end
+    return Vector3.new(targetPos.X, safeY, targetPos.Z), waterY
+end
+
+-- =========================================================
+-- WEAPON HELPERS
+-- =========================================================
+local MELEE_STYLES = {
+    "combat", "dark step", "electric", "water kung fu",
+    "dragon breath", "superhuman", "death step",
+    "sharkman karate", "electric claw", "dragon talon",
+    "godhuman", "sanguine art",
+}
+
+local function isMeleeStyle(name)
+    local n = tostring(name):lower()
+    for _, s in ipairs(MELEE_STYLES) do
+        if n:find(s, 1, true) then return true end
+    end
+    return false
+end
+
+local function looksLikeFruitTool(name)
+    -- Blox Fruits fruit tools usually "X-X" or "X X" patterns; treat hyphens as fruit markers
+    return tostring(name):find("%-") ~= nil
+end
+
+local function getEquippedFightingStyle()
+    local char = player.Character
+    if not char then return "Combat" end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool and isMeleeStyle(tool.Name) then return tool.Name end
+    return "Combat"
+end
+
+-- Attempt to equip a tool matching the selected category.
+-- Returns the equipped tool, or nil if none found.
+local function equipWeaponOfCategory(category)
+    local char = player.Character
+    if not char then return nil end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return nil end
+
+    local current = char:FindFirstChildOfClass("Tool")
+    if current then
+        local isMelee = isMeleeStyle(current.Name)
+        if (category == "Melee" and isMelee) or (category == "Sword" and not isMelee and not looksLikeFruitTool(current.Name)) then
+            return current
+        end
+    end
+
+    local backpack = player:FindFirstChild("Backpack")
+    if not backpack then return nil end
+
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            local isMelee = isMeleeStyle(tool.Name)
+            local isFruit = looksLikeFruitTool(tool.Name)
+            local match = false
+            if category == "Melee" then
+                match = isMelee
+            elseif category == "Sword" then
+                match = (not isMelee) and (not isFruit)
+            end
+            if match then
+                pcall(function() humanoid:EquipTool(tool) end)
+                return tool
+            end
+        end
+    end
+    return nil
+end
+
+-- =========================================================
+-- PUMPKIN DETECTION (map-wide via PumpkinHunt, skips blacklisted)
 -- =========================================================
 local function findClosestPumpkin()
     local hunt = Workspace:FindFirstChild("PumpkinHunt")
@@ -660,41 +852,26 @@ local function findClosestPumpkin()
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil, nil end
 
+    local now = os.clock()
     local best, bestDist, bestRoot = nil, math.huge, nil
     local ok, descendants = pcall(function() return hunt:GetDescendants() end)
     if not ok then return nil, nil end
 
     for _, d in ipairs(descendants) do
         if d:IsA("Model") and d.Parent and d.Name:lower():find("pumpkin", 1, true) then
-            local root = d:FindFirstChild("RootPart") or d:FindFirstChild("HumanoidRootPart")
-            if root and root:IsA("BasePart") and root.Parent then
-                local dist = (root.Position - hrp.Position).Magnitude
-                if dist < bestDist then
-                    best, bestDist, bestRoot = d, dist, root
+            local bl = pumpkinFarm.blacklist[d]
+            if not (bl and bl > now) then
+                local root = d:FindFirstChild("RootPart") or d:FindFirstChild("HumanoidRootPart")
+                if root and root:IsA("BasePart") and root.Parent then
+                    local dist = (root.Position - hrp.Position).Magnitude
+                    if dist < bestDist then
+                        best, bestDist, bestRoot = d, dist, root
+                    end
                 end
             end
         end
     end
     return best, bestRoot
-end
-
-local function getEquippedFightingStyle()
-    local char = player.Character
-    if not char then return "Combat" end
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then
-        local n = tool.Name:lower()
-        local styles = {
-            "combat", "dark step", "electric", "water kung fu",
-            "dragon breath", "superhuman", "death step",
-            "sharkman karate", "electric claw", "dragon talon",
-            "godhuman", "sanguine art",
-        }
-        for _, s in ipairs(styles) do
-            if n:find(s, 1, true) then return tool.Name end
-        end
-    end
-    return "Combat"
 end
 
 local function fireRegisterAttack()
@@ -710,7 +887,7 @@ local function fireRegisterHit(rootPart)
 end
 
 -- =========================================================
--- SINGLE RENDER LOOP: fly movement + auto noclip
+-- RENDER LOOP: fly movement + water safety + auto noclip
 -- =========================================================
 RunService.RenderStepped:Connect(function(dt)
     if not pumpkinFarm.running then return end
@@ -721,14 +898,24 @@ RunService.RenderStepped:Connect(function(dt)
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then return end
 
-    -- Character changed (respawn): reset tracked parts, re-apply PlatformStand
+    -- Character changed (respawn)
     if hum ~= pumpkinFarm.lastHumanoid then
         pumpkinFarm.lastHumanoid = hum
         noclipParts = {}
+        pumpkinFarm.flyTarget = nil
+        pumpkinFarm.currentPumpkin = nil
+        pumpkinFarm.currentRoot = nil
+        pumpkinFarm.targetWaterY = nil
+        pumpkinFarm.stuckTime = 0
+        pumpkinFarm.lastDistance = nil
+        pumpkinFarm.lastY = nil
+        pumpkinFarm.lastDy = nil
+        pumpkinFarm.oscillationCount = 0
+        pumpkinFarm.weaponEquippedFor = nil
         pcall(function() hum.PlatformStand = true end)
     end
 
-    -- Auto noclip: track only parts we disabled
+    -- Auto noclip
     for _, part in ipairs(char:GetChildren()) do
         if part:IsA("BasePart") and part.CanCollide then
             part.CanCollide = false
@@ -746,18 +933,63 @@ RunService.RenderStepped:Connect(function(dt)
             local step = math.min(dist, pumpkinFarm.speed * dt)
             hrp.CFrame = hrp.CFrame + offset.Unit * step
         end
+
+        -- Periodic water safety: if somehow we end up underwater mid-flight, lift
+        if os.clock() - pumpkinFarm.lastWaterCheck > CONFIG.WATER_CHECK_INTERVAL then
+            pumpkinFarm.lastWaterCheck = os.clock()
+            local waterY = getWaterHeightAt(hrp.Position.X, hrp.Position.Z)
+            if waterY and hrp.Position.Y < waterY + CONFIG.MIN_HEIGHT_ABOVE_WATER then
+                local liftTo = waterY + CONFIG.MIN_HEIGHT_ABOVE_WATER + 1
+                hrp.CFrame = CFrame.new(hrp.Position.X, liftTo, hrp.Position.Z) * (hrp.CFrame - hrp.CFrame.Position)
+                if pumpkinFarm.flyTarget then
+                    pumpkinFarm.flyTarget = Vector3.new(pumpkinFarm.flyTarget.X, math.max(pumpkinFarm.flyTarget.Y, liftTo), pumpkinFarm.flyTarget.Z)
+                end
+            end
+        end
     end
 end)
 
 -- =========================================================
--- PUMPKIN FARM TICK (state machine, no movement here)
+-- PUMPKIN FARM TICK (state machine)
 -- =========================================================
+local function resetStuckTracking()
+    pumpkinFarm.stuckTime = 0
+    pumpkinFarm.lastDistance = nil
+    pumpkinFarm.lastY = nil
+    pumpkinFarm.lastDy = nil
+    pumpkinFarm.oscillationCount = 0
+end
+
+local function blacklistTarget(reason)
+    local p = pumpkinFarm.currentPumpkin
+    if p then
+        pumpkinFarm.blacklist[p] = os.clock() + CONFIG.BLACKLIST_DURATION
+        addLog("PUMPKIN", string.format("Blacklisting %s for %ds (%s)", tostring(p.Name), CONFIG.BLACKLIST_DURATION, reason))
+    end
+    pumpkinFarm.currentPumpkin = nil
+    pumpkinFarm.currentRoot = nil
+    pumpkinFarm.flyTarget = nil
+    pumpkinFarm.targetWaterY = nil
+    pumpkinFarm.weaponEquippedFor = nil
+    resetStuckTracking()
+end
+
 local function pumpkinFarmTick()
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then
         setFeatureStatus("pumpkin", "no character")
         return
+    end
+
+    -- Prune expired blacklist entries occasionally
+    if math.random() < 0.05 then
+        local now = os.clock()
+        for k, v in pairs(pumpkinFarm.blacklist) do
+            if v < now or not k.Parent then
+                pumpkinFarm.blacklist[k] = nil
+            end
+        end
     end
 
     -- Validate target
@@ -769,16 +1001,19 @@ local function pumpkinFarmTick()
             pumpkinFarm.currentPumpkin = nil
             pumpkinFarm.currentRoot = nil
             pumpkinFarm.flyTarget = nil
+            pumpkinFarm.targetWaterY = nil
+            pumpkinFarm.weaponEquippedFor = nil
+            resetStuckTracking()
         end
     end
 
-    -- If no target, try to find one (respecting WAITING backoff)
+    -- Acquire target if none
     if not pumpkinFarm.currentPumpkin then
         if pumpkinFarm.state == "WAITING" and pumpkinFarm.lastRespawnAt then
             local remain = CONFIG.PUMPKIN_RESPAWN - (os.clock() - pumpkinFarm.lastRespawnAt)
             local sinceCheck = os.clock() - pumpkinFarm.lastWaitScanTime
             if remain > 0 and sinceCheck < CONFIG.WAITING_RESCAN then
-                setFeatureStatus("pumpkin", string.format("respawn est. %02d:%02d", math.floor(remain/60), math.floor(remain%60)))
+                setFeatureStatus("pumpkin", string.format("waiting (est. %02d:%02d)", math.floor(remain/60), math.floor(remain%60)))
                 return
             end
             pumpkinFarm.lastWaitScanTime = os.clock()
@@ -789,8 +1024,12 @@ local function pumpkinFarmTick()
             pumpkinFarm.currentPumpkin = p
             pumpkinFarm.currentRoot = r
             pumpkinFarm.state = "MOVING"
-            pumpkinFarm.flyTarget = r.Position
+            local safePos, waterY = computeSafeFlyTarget(r.Position)
+            pumpkinFarm.flyTarget = safePos
+            pumpkinFarm.targetWaterY = waterY
             pumpkinFarm.lastRespawnAt = nil
+            pumpkinFarm.weaponEquippedFor = nil
+            resetStuckTracking()
             addLog("PUMPKIN", "Targeting " .. p.Name)
         else
             if pumpkinFarm.state ~= "WAITING" then
@@ -800,25 +1039,76 @@ local function pumpkinFarmTick()
                 addLog("PUMPKIN", "No pumpkins available. Waiting for respawn.")
             end
             pumpkinFarm.flyTarget = nil
+            pumpkinFarm.targetWaterY = nil
             setFeatureStatus("pumpkin", "no pumpkins")
             return
         end
     end
 
-    -- Act on target
     local root = pumpkinFarm.currentRoot
     local pumpkin = pumpkinFarm.currentPumpkin
     if not root or not pumpkin then return end
 
+    -- Progress tracking for stuck detection
     local dist = (root.Position - hrp.Position).Magnitude
+    if pumpkinFarm.lastDistance then
+        local delta = pumpkinFarm.lastDistance - dist
+        if delta < CONFIG.PROGRESS_THRESHOLD then
+            pumpkinFarm.stuckTime = pumpkinFarm.stuckTime + CONFIG.STUCK_TICK_DT
+        else
+            pumpkinFarm.stuckTime = 0
+        end
+    end
+    pumpkinFarm.lastDistance = dist
+
+    -- Vertical oscillation detection
+    if pumpkinFarm.lastY then
+        local dy = hrp.Position.Y - pumpkinFarm.lastY
+        if pumpkinFarm.lastDy and math.abs(dy) > 0.1 and math.abs(pumpkinFarm.lastDy) > 0.1 then
+            if (dy > 0) ~= (pumpkinFarm.lastDy > 0) then
+                pumpkinFarm.oscillationCount = pumpkinFarm.oscillationCount + 1
+            end
+        end
+        pumpkinFarm.lastDy = dy
+    end
+    pumpkinFarm.lastY = hrp.Position.Y
+
+    -- Trigger stuck recovery
+    if pumpkinFarm.stuckTime >= CONFIG.STUCK_TIMEOUT then
+        blacklistTarget(string.format("no progress %.1fs", pumpkinFarm.stuckTime))
+        return
+    end
+    if pumpkinFarm.oscillationCount >= CONFIG.OSCILLATION_THRESHOLD then
+        blacklistTarget(string.format("Y-oscillation x%d", pumpkinFarm.oscillationCount))
+        return
+    end
+
     if dist > CONFIG.TOUCH_DISTANCE then
-        pumpkinFarm.flyTarget = root.Position
+        if not pumpkinFarm.flyTarget then
+            local safePos, waterY = computeSafeFlyTarget(root.Position)
+            pumpkinFarm.flyTarget = safePos
+            pumpkinFarm.targetWaterY = waterY
+        end
         pumpkinFarm.state = "MOVING"
-        setFeatureStatus("pumpkin", string.format("flying (%.0f studs @ %d/s)", dist, pumpkinFarm.speed))
+        setFeatureStatus("pumpkin", string.format("flying %.0f studs @ %d/s", dist, pumpkinFarm.speed))
     else
         pumpkinFarm.flyTarget = nil
         pumpkinFarm.state = "ATTACKING"
-        setFeatureStatus("pumpkin", "attacking " .. pumpkin.Name .. " (" .. getEquippedFightingStyle() .. ")")
+
+        -- Equip appropriate weapon once per target
+        if pumpkinFarm.weaponEquippedFor ~= pumpkin then
+            local equipped = equipWeaponOfCategory(pumpkinFarm.weaponCategory)
+            pumpkinFarm.weaponEquippedFor = pumpkin
+            if equipped then
+                addLog("WEAPON", "Equipped for attack: " .. equipped.Name .. " (" .. pumpkinFarm.weaponCategory .. ")")
+            else
+                addLog("WEAPON", "No tool found matching category " .. pumpkinFarm.weaponCategory .. "; keeping current.")
+            end
+        end
+
+        local currentTool = char and char:FindFirstChildOfClass("Tool")
+        local style = currentTool and currentTool.Name or "Combat"
+        setFeatureStatus("pumpkin", "attacking " .. pumpkin.Name .. " (" .. style .. ")")
 
         pcall(function()
             hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(root.Position.X, hrp.Position.Y, root.Position.Z))
@@ -843,13 +1133,17 @@ local function pumpkinFarmStart()
     pumpkinFarm.currentPumpkin = nil
     pumpkinFarm.currentRoot = nil
     pumpkinFarm.flyTarget = nil
+    pumpkinFarm.targetWaterY = nil
     pumpkinFarm.lastRespawnAt = nil
     pumpkinFarm.lastWaitScanTime = 0
     pumpkinFarm.lastAttackTime = 0
     pumpkinFarm.lastHumanoid = nil
+    pumpkinFarm.lastWaterCheck = 0
+    pumpkinFarm.weaponEquippedFor = nil
+    resetStuckTracking()
     noclipParts = {}
 
-    addLog("PUMPKIN", "Auto Pumpkin Farm started. Flying @ " .. pumpkinFarm.speed .. " studs/s. Auto-noclip ON.")
+    addLog("PUMPKIN", string.format("Started. Fly %d/s, weapon %s, auto-noclip ON, water-safe ON.", pumpkinFarm.speed, pumpkinFarm.weaponCategory))
     pumpkinFarm.thread = task.spawn(function()
         while pumpkinFarm.running do
             pcall(pumpkinFarmTick)
@@ -867,8 +1161,11 @@ local function stopPumpkinFarm()
     pumpkinFarm.flyTarget = nil
     pumpkinFarm.currentPumpkin = nil
     pumpkinFarm.currentRoot = nil
+    pumpkinFarm.targetWaterY = nil
     pumpkinFarm.state = "IDLE"
     pumpkinFarm.lastRespawnAt = nil
+    pumpkinFarm.weaponEquippedFor = nil
+    resetStuckTracking()
 
     for part in pairs(noclipParts) do
         pcall(function()
@@ -886,17 +1183,22 @@ local function stopPumpkinFarm()
     end
     pumpkinFarm.lastHumanoid = nil
 
-    addLog("PUMPKIN", "Auto Pumpkin Farm stopped. Noclip OFF.")
+    addLog("PUMPKIN", "Stopped. Noclip OFF.")
 end
 
 -- =========================================================
--- AUTO TRICK OR TREAT
+-- AUTO TRICK OR TREAT (with diagnostics)
 -- =========================================================
 local trickOrTreat = {
     running = false,
     thread = nil,
     delay = 1.5,
+    lastDoor = nil,
 }
+
+local function setToTStatus(text)
+    setFeatureStatus("treat", text)
+end
 
 local function findTrickOrTreatDoors()
     local doors = {}
@@ -929,61 +1231,89 @@ local function stopTrickOrTreat()
         pcall(function() task.cancel(trickOrTreat.thread) end)
         trickOrTreat.thread = nil
     end
+    setToTStatus("Stopped")
     addLog("TREAT", "Auto Trick or Treat stopped.")
 end
 
 local function trickOrTreatStart()
     if trickOrTreat.running then return end
     trickOrTreat.running = true
-    addLog("TREAT", "Auto Trick or Treat started. Best-effort.")
+    setToTStatus("Searching...")
+    addLog("TREAT", "Auto Trick or Treat started. Best-effort: searches door models, uses ProximityPrompt or OnTalkToNPC.")
     trickOrTreat.thread = task.spawn(function()
         while trickOrTreat.running do
-            local char = player.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if not hrp then
-                setFeatureStatus("treat", "no character")
-                task.wait(1)
-            else
+            local ok, err = pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+                if not hrp or not hum then
+                    setToTStatus("Error: no character")
+                    task.wait(1)
+                    return
+                end
+
+                -- If pumpkin farm has PlatformStand on, MoveTo won't work
+                if hum.PlatformStand then
+                    setToTStatus("Waiting: movement disabled by other feature")
+                    task.wait(1)
+                    return
+                end
+
+                setToTStatus("Searching...")
                 local doors = findTrickOrTreatDoors()
                 if #doors == 0 then
-                    setFeatureStatus("treat", "no doors found")
-                else
-                    local best, bestDist = nil, math.huge
-                    for _, door in ipairs(doors) do
-                        local root = door:FindFirstChild("RootPart") or door:FindFirstChild("HumanoidRootPart") or door.PrimaryPart
-                        if root and root:IsA("BasePart") then
-                            local dist = (root.Position - hrp.Position).Magnitude
-                            if dist < bestDist then best, bestDist = door, dist end
-                        end
-                    end
-                    if best and bestDist <= 10 then
-                        local prompt = best:FindFirstChildWhichIsA("ProximityPrompt", true)
-                        if prompt then
-                            pcall(function() prompt:InputHoldBegin() end)
-                            task.wait(0.1)
-                            pcall(function() prompt:InputHoldEnd() end)
-                            addLog("TREAT", "ProximityPrompt on " .. best.Name)
-                        else
-                            local remote = findRemotePath(ReplicatedStorage, { "Remotes", "OnTalkToNPC" })
-                            if remote then
-                                pcall(function() remote:FireServer(best) end)
-                                addLog("TREAT", "OnTalkToNPC on " .. best.Name)
-                            else
-                                addLog("TREAT", "No interaction method for " .. best.Name)
-                            end
-                        end
-                        task.wait(trickOrTreat.delay)
-                    elseif best then
-                        local hum = char and char:FindFirstChildOfClass("Humanoid")
-                        if hum then
-                            pcall(function()
-                                local root = best:FindFirstChild("RootPart") or best:FindFirstChild("HumanoidRootPart") or best.PrimaryPart
-                                if root then hum:MoveTo(root.Position) end
-                            end)
-                        end
-                        setFeatureStatus("treat", string.format("moving to %s (%.0f studs)", best.Name, bestDist))
+                    setToTStatus("Searching (no doors found)")
+                    task.wait(2)
+                    return
+                end
+
+                local best, bestDist = nil, math.huge
+                for _, door in ipairs(doors) do
+                    local root = door:FindFirstChild("RootPart") or door:FindFirstChild("HumanoidRootPart") or door.PrimaryPart
+                    if root and root:IsA("BasePart") then
+                        local dist = (root.Position - hrp.Position).Magnitude
+                        if dist < bestDist then best, bestDist = door, dist end
                     end
                 end
+
+                if not best then
+                    setToTStatus("Searching (doors have no RootPart)")
+                    task.wait(2)
+                    return
+                end
+
+                if bestDist <= 10 then
+                    setToTStatus("Interaction attempted: " .. best.Name)
+                    local prompt = best:FindFirstChildWhichIsA("ProximityPrompt", true)
+                    if prompt then
+                        pcall(function() prompt:InputHoldBegin() end)
+                        task.wait(0.1)
+                        pcall(function() prompt:InputHoldEnd() end)
+                        addLog("TREAT", "ProximityPrompt on " .. best.Name)
+                    else
+                        local remote = findRemotePath(ReplicatedStorage, { "Remotes", "OnTalkToNPC" })
+                        if remote then
+                            pcall(function() remote:FireServer(best) end)
+                            addLog("TREAT", "OnTalkToNPC on " .. best.Name)
+                        else
+                            addLog("TREAT", "No interaction method for " .. best.Name)
+                            setToTStatus("Error: no interaction method")
+                        end
+                    end
+                    setToTStatus("Waiting (cooldown)")
+                    task.wait(trickOrTreat.delay)
+                else
+                    setToTStatus(string.format("Target found: %s (%.0f studs)", best.Name, bestDist))
+                    local root = best:FindFirstChild("RootPart") or best:FindFirstChild("HumanoidRootPart") or best.PrimaryPart
+                    if root then
+                        pcall(function() hum:MoveTo(root.Position) end)
+                    end
+                end
+            end)
+            if not ok then
+                setToTStatus("Error: " .. tostring(err))
+                addLog("ERROR", "Trick or Treat tick: " .. tostring(err))
             end
             task.wait(0.5)
         end
@@ -991,7 +1321,7 @@ local function trickOrTreatStart()
 end
 
 -- =========================================================
--- EVENT KEYWORD OBSERVER (event-driven, no full workspace scan)
+-- EVENT KEYWORD OBSERVER (event-driven)
 -- =========================================================
 local eventObserver = {
     running = false,
@@ -1292,8 +1622,8 @@ end
 -- =========================================================
 -- REGISTER FEATURES
 -- =========================================================
-addFeature("pumpkin", "Auto Pumpkin Farm", "Fly to pumpkins, auto-noclip, best-effort attack.", pumpkinFarmStart, stopPumpkinFarm, nil)
-addFeature("treat", "Auto Trick or Treat", "Detects doors, attempts ProximityPrompt / OnTalkToNPC.", trickOrTreatStart, stopTrickOrTreat, nil)
+addFeature("pumpkin", "Auto Pumpkin Farm", "Fly + water-safe + noclip + weapon select + stuck recovery.", pumpkinFarmStart, stopPumpkinFarm, nil)
+addFeature("treat", "Auto Trick or Treat", "Searches doors, tries prompt/OnTalkToNPC. Reports status.", trickOrTreatStart, stopTrickOrTreat, nil)
 addFeature("events", "Event Keyword Observer", "Event-driven. No full workspace scan.", eventObserverStart, stopEventObserver, nil)
 addFeature("materials", "Material Scanner", "Reads local attributes, leaderstats, tools.", materialStart, nil, materialTick)
 addFeature("gacha", "Halloween Gacha Monitor", "Checks remote presence. Use Check to probe.", gachaStart, nil, gachaTick, "Check", probeGacha)
@@ -1374,6 +1704,17 @@ minBtn.MouseButton1Click:Connect(function()
 end)
 
 closeBtn.MouseButton1Click:Connect(function()
+    -- Stop every running feature FIRST so their onStop cleanup runs before the GUI
+    -- vanishes. This cancels feature threads, restores CanCollide on any noclip'd
+    -- parts, clears Humanoid.PlatformStand, and disconnects the event observer.
+    -- Without this, the RenderStepped fly/noclip loop keeps running after the window
+    -- closes because it is gated by pumpkinFarm.running, not by screenGui.Parent.
+    for _, id in ipairs(featureOrder) do
+        pcall(function() setFeatureRunning(id, false, true) end)
+    end
+    -- One short frame so any pending cleanup (noclip restore, PlatformStand reset)
+    -- commits before the frame is destroyed.
+    task.wait(0.1)
     if screenGui then screenGui:Destroy() end
 end)
 
@@ -1401,7 +1742,7 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
-addLog("SYS", "ELITES HALLOWEEN FARM v6 loaded. Flying farm + auto-noclip + speed slider.")
-addLog("SYS", "Server still validates attack remotes; farming is best-effort.")
+addLog("SYS", "ELITES HALLOWEEN FARM v7 loaded. Speed 50–400, water-safe fly, weapon select, stuck recovery.")
+addLog("SYS", "Attack still server-validated; farming is best-effort.")
 updateSummary()
-warn("[EHF] v6 GUI loaded successfully.")
+warn("[EHF] v7 GUI loaded successfully.")

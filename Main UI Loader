@@ -1,0 +1,643 @@
+
+-- ELITES HALLOWEEN FARM V3 GUI
+-- StarterPlayer > StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotes = ReplicatedStorage:WaitForChild("HalloweenFarmRemotes")
+local Action = remotes:WaitForChild("Action")
+local Update = remotes:WaitForChild("Update")
+local GetState = remotes:WaitForChild("GetState")
+
+local old = playerGui:FindFirstChild("ElitesHalloweenFarm")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "ElitesHalloweenFarm"
+gui.ResetOnSpawn = false
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(320, 420)
+main.Position = UDim2.new(0.5, -160, 0.5, -210)
+main.BackgroundColor3 = Color3.fromRGB(20, 19, 30)
+main.BorderSizePixel = 0
+main.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = main
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(150, 75, 220)
+stroke.Thickness = 2
+stroke.Parent = main
+
+-- HEADER / DRAG BAR
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 38)
+header.BackgroundColor3 = Color3.fromRGB(40, 28, 55)
+header.BorderSizePixel = 0
+header.Parent = main
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "🎃 ELITES HALLOWEEN V3"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(27, 27)
+close.Position = UDim2.new(1, -32, 0, 5)
+close.Text = "X"
+close.BackgroundColor3 = Color3.fromRGB(175, 45, 65)
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 14
+close.Parent = header
+
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+
+-- DRAGGING
+local dragging = false
+local dragStart
+local startPos
+
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    ) then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+local function makeLabel(text, y)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -20, 0, 23)
+    l.Position = UDim2.fromOffset(10, y)
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = Color3.fromRGB(240, 235, 250)
+    l.Font = Enum.Font.GothamBold
+    l.TextSize = 13
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = main
+    return l
+end
+
+local status = makeLabel("Status: Connecting...", 48)
+local candy = makeLabel("🍬 Candy Corn: 0", 76)
+local bits = makeLabel("🎃 Pumpkin Bits: 0 / 1000", 103)
+local defeated = makeLabel("Pumpkins defeated: 0", 130)
+local seeds = makeLabel("Cursed Seeds: 0", 157)
+local rolls = makeLabel("Gacha rolls: 0 / 2", 184)
+local cooldown = makeLabel("Next pumpkin: Ready", 211)
+
+local function makeButton(name, text, x, y, width)
+    local b = Instance.new("TextButton")
+    b.Name = name
+    b.Size = UDim2.fromOffset(width, 34)
+    b.Position = UDim2.fromOffset(x, y)
+    b.Text = text
+    b.BackgroundColor3 = Color3.fromRGB(95, 55, 155)
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.Parent = main
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local start = makeButton("Start", "START", 10, 246, 93)
+local pause = makeButton("Pause", "PAUSE", 113, 246, 93)
+local stop = makeButton("Stop", "STOP", 216, 246, 93)
+
+local roll = makeButton("Roll", "ROLL - 500", 10, 288, 145)
+local store = makeButton("Store", "STORE FRUIT", 165, 288, 144)
+
+local inventory = makeLabel("Fruits: None", 330)
+local stored = makeLabel("Stored: None", 355)
+
+local logFrame = Instance.new("ScrollingFrame")
+logFrame.Position = UDim2.fromOffset(10, 383)
+logFrame.Size = UDim2.new(1, -20, 0, 28)
+logFrame.BackgroundColor3 = Color3.fromRGB(32, 29, 43)
+logFrame.BorderSizePixel = 0
+logFrame.ScrollBarThickness = 3
+logFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logFrame.CanvasSize = UDim2.new()
+logFrame.Parent = main
+
+local logLayout = Instance.new("UIListLayout")
+logLayout.Parent = logFrame
+logLayout.Padding = UDim.new(0, 2)
+
+local latestFruit
+
+local function addLog(message)
+    if not message or message == "" then return end
+
+    local line = Instance.new("TextLabel")
+    line.Size = UDim2.new(1, -6, 0, 18)
+    line.BackgroundTransparency = 1
+    line.TextColor3 = Color3.fromRGB(205, 195, 220)
+    line.TextXAlignment = Enum.TextXAlignment.Left
+    line.Font = Enum.Font.Gotham
+    line.TextSize = 10
+    line.Text = os.date("%H:%M:%S") .. " | " .. message
+    line.Parent = logFrame
+end
+
+local nextPumpkinTime = 0
+
+local function display(d)
+    status.Text = "Status: " .. tostring(d.Status)
+    candy.Text = "🍬 Candy Corn: " .. tostring(d.Candy)
+    bits.Text = "🎃 Pumpkin Bits: " .. tostring(d.Bits) .. " / 1000"
+    defeated.Text = "Pumpkins defeated: " .. tostring(d.Defeated)
+    seeds.Text = "Cursed Seeds: " .. tostring(d.Seeds)
+    rolls.Text = "Gacha rolls: " .. tostring(d.Rolls) .. " / 2"
+
+    local fruits = d.Fruits or {}
+    local storedFruits = d.Stored or {}
+
+    latestFruit = fruits[#fruits]
+
+    inventory.Text = "Fruits: "
+        .. (#fruits > 0 and table.concat(fruits, ", ") or "None")
+
+    stored.Text = "Stored: "
+        .. (#storedFruits > 0
+            and table.concat(storedFruits, ", ")
+            or "None")
+
+    nextPumpkinTime = d.NextPumpkin or 0
+
+    addLog(d.Message)
+end
+
+RunService.Heartbeat:Connect(function()
+    if nextPumpkinTime > os.time() then
+        cooldown.Text = "Next pumpkin: "
+            .. tostring(nextPumpkinTime - os.time()) .. "s"
+    else
+        cooldown.Text = "Next pumpkin: Ready"
+    end
+end)
+
+Update.OnClientEvent:Connect(display)
+
+start.Activated:Connect(function()
+    Action:FireServer("Start")
+end)
+
+pause.Activated:Connect(function()
+    Action:FireServer("Pause")
+end)
+
+stop.Activated:Connect(function()
+    Action:FireServer("Stop")
+end)
+
+roll.Activated:Connect(function()
+    Action:FireServer("Roll")
+end)
+
+store.Activated:Connect(function()
+    if latestFruit then
+        Action:FireServer("Store", latestFruit)
+    else
+        addLog("No fruit available.")
+    end
+end)
+
+close.Activated:Connect(function()
+    Action:FireServer("Stop")
+    gui:Destroy()
+end)
+
+local success, initial = pcall(function()
+    return GetState:InvokeServer()
+end)
+
+if success then
+    display(initial)
+    addLog("Elites Halloween Farm V3 connected.")
+else
+    status.Text = "Status: Server connection failed"
+    addLog("Check HalloweenFarmServer in ServerScriptService.")
+end
+
+-- ELITES HALLOWEEN FARM V3
+-- Place in ServerScriptService
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local CONFIG = {
+    PUMPKIN_HEALTH = 100,
+    PUMPKIN_DAMAGE = 25,
+    PUMPKIN_CANDY = 100,
+    PUMPKIN_BITS = 10,
+
+    SPECIAL_HEALTH = 250,
+    SPECIAL_CANDY = 250,
+    SPECIAL_BITS = 25,
+
+    PUMPKIN_RESPAWN = 690,
+
+    GACHA_COST = 500,
+    ROLLS_PER_HOUR = 2,
+    ROLL_WINDOW = 3600,
+
+    FARM_INTERVAL = 0.4,
+}
+
+local random = Random.new()
+local data = {}
+local loops = {}
+
+-- Remote setup
+local folder = ReplicatedStorage:FindFirstChild("HalloweenFarmRemotes")
+if not folder then
+    folder = Instance.new("Folder")
+    folder.Name = "HalloweenFarmRemotes"
+    folder.Parent = ReplicatedStorage
+end
+
+local function remote(className, name)
+    local obj = folder:FindFirstChild(name)
+    if not obj then
+        obj = Instance.new(className)
+        obj.Name = name
+        obj.Parent = folder
+    end
+    return obj
+end
+
+local Action = remote("RemoteEvent", "Action")
+local Update = remote("RemoteEvent", "Update")
+local GetState = remote("RemoteFunction", "GetState")
+
+local enemies = workspace:FindFirstChild("HalloweenEnemies")
+if not enemies then
+    enemies = Instance.new("Folder")
+    enemies.Name = "HalloweenEnemies"
+    enemies.Parent = workspace
+end
+
+local fruitPool = {
+    "Rocket", "Spin", "Chop", "Spring", "Bomb",
+    "Smoke", "Spike", "Flame", "Sand", "Ice",
+    "Dark", "Light", "Magma", "Buddha", "Portal",
+}
+
+local function getData(player)
+    if not data[player] then
+        data[player] = {
+            Candy = 0,
+            Bits = 0,
+            Defeated = 0,
+            Seeds = 0,
+            Fruits = {},
+            Stored = {},
+            RollTimes = {},
+            Running = false,
+            Paused = false,
+            Status = "Stopped",
+            NextPumpkin = 0,
+            Generation = 0,
+        }
+    end
+    return data[player]
+end
+
+local function update(player, message)
+    local d = getData(player)
+
+    Update:FireClient(player, {
+        Candy = d.Candy,
+        Bits = d.Bits,
+        Defeated = d.Defeated,
+        Seeds = d.Seeds,
+        Fruits = d.Fruits,
+        Stored = d.Stored,
+        Rolls = #d.RollTimes,
+        Status = d.Status,
+        NextPumpkin = d.NextPumpkin,
+        Message = message or "",
+    })
+end
+
+local function reward(player, candy, bits)
+    local d = getData(player)
+    d.Candy += candy
+    d.Bits = math.min(1000, d.Bits + bits)
+end
+
+local function removeEnemies(player)
+    for _, enemy in ipairs(enemies:GetChildren()) do
+        if enemy:GetAttribute("Owner") == player.UserId then
+            enemy:Destroy()
+        end
+    end
+end
+
+local function spawnEnemy(player, special)
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local origin = root and root.Position or Vector3.new(0, 5, 0)
+
+    local enemy = Instance.new("Part")
+    enemy.Name = special and "Jack-o-lantern" or "Pumpkin"
+    enemy.Shape = Enum.PartType.Ball
+    enemy.Anchored = true
+    enemy.CanCollide = false
+    enemy.Material = Enum.Material.Neon
+    enemy.Color = special
+        and Color3.fromRGB(255, 65, 15)
+        or Color3.fromRGB(255, 145, 20)
+
+    enemy.Size = special
+        and Vector3.new(7, 7, 7)
+        or Vector3.new(5, 5, 5)
+
+    enemy.Position = origin + Vector3.new(
+        random:NextInteger(-15, 15),
+        3,
+        random:NextInteger(-15, 15)
+    )
+
+    enemy:SetAttribute("Owner", player.UserId)
+    enemy:SetAttribute(
+        "Health",
+        special and CONFIG.SPECIAL_HEALTH or CONFIG.PUMPKIN_HEALTH
+    )
+
+    enemy.Parent = enemies
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Size = UDim2.fromOffset(170, 35)
+    billboard.StudsOffset = Vector3.new(0, 4, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = enemy
+
+    local text = Instance.new("TextLabel")
+    text.Size = UDim2.fromScale(1, 1)
+    text.BackgroundTransparency = 1
+    text.TextColor3 = Color3.new(1, 1, 1)
+    text.TextStrokeTransparency = 0
+    text.Font = Enum.Font.GothamBold
+    text.TextScaled = true
+    text.Parent = billboard
+
+    local function refresh()
+        text.Text = enemy.Name .. " | HP: "
+            .. tostring(enemy:GetAttribute("Health"))
+    end
+
+    refresh()
+    return enemy, refresh
+end
+
+local function waitUntilActive(player, generation)
+    local d = getData(player)
+
+    while player.Parent
+        and d.Running
+        and d.Generation == generation
+        and d.Paused do
+        task.wait(0.2)
+    end
+
+    return player.Parent
+        and d.Running
+        and d.Generation == generation
+end
+
+local function fight(player, enemy, refresh, generation)
+    local d = getData(player)
+
+    while enemy.Parent and d.Running
+        and d.Generation == generation do
+
+        if not waitUntilActive(player, generation) then
+            break
+        end
+
+        local health = enemy:GetAttribute("Health") or 0
+        health -= CONFIG.PUMPKIN_DAMAGE
+        enemy:SetAttribute("Health", math.max(0, health))
+        refresh()
+
+        if health <= 0 then
+            enemy:Destroy()
+            return true
+        end
+
+        task.wait(CONFIG.FARM_INTERVAL)
+    end
+
+    return false
+end
+
+local function fightSpecial(player, generation)
+    local d = getData(player)
+    local enemy, refresh = spawnEnemy(player, true)
+
+    update(player, "Jack-o-lantern appeared!")
+
+    if fight(player, enemy, refresh, generation) then
+        reward(player, CONFIG.SPECIAL_CANDY, CONFIG.SPECIAL_BITS)
+        d.Seeds += 1
+        update(player, "Jack-o-lantern defeated! +1 Cursed Seed.")
+    end
+end
+
+local function farm(player, generation)
+    local d = getData(player)
+
+    while player.Parent and d.Running
+        and d.Generation == generation do
+
+        if not waitUntilActive(player, generation) then
+            break
+        end
+
+        local remaining = d.NextPumpkin - os.time()
+
+        if remaining > 0 then
+            update(player, "Pumpkin respawning: " .. remaining .. " seconds")
+            task.wait(1)
+        else
+            local enemy, refresh = spawnEnemy(player, false)
+            update(player, "Pumpkin found! Attacking...")
+
+            if fight(player, enemy, refresh, generation) then
+                d.Defeated += 1
+                reward(player, CONFIG.PUMPKIN_CANDY, CONFIG.PUMPKIN_BITS)
+
+                d.NextPumpkin = os.time() + CONFIG.PUMPKIN_RESPAWN
+
+                update(player, "Pumpkin defeated! Rewards collected.")
+
+                if d.Defeated % 3 == 0 then
+                    fightSpecial(player, generation)
+                end
+            else
+                if enemy.Parent then
+                    enemy:Destroy()
+                end
+            end
+        end
+    end
+end
+
+local function cleanRolls(d)
+    local now = os.time()
+
+    for i = #d.RollTimes, 1, -1 do
+        if now - d.RollTimes[i] >= CONFIG.ROLL_WINDOW then
+            table.remove(d.RollTimes, i)
+        end
+    end
+end
+
+local function roll(player)
+    local d = getData(player)
+    cleanRolls(d)
+
+    if #d.RollTimes >= CONFIG.ROLLS_PER_HOUR then
+        update(player, "Two-roll hourly limit reached.")
+        return
+    end
+
+    if d.Candy < CONFIG.GACHA_COST then
+        update(player, "Not enough Candy Corn.")
+        return
+    end
+
+    d.Candy -= CONFIG.GACHA_COST
+    table.insert(d.RollTimes, os.time())
+
+    local fruit = fruitPool[random:NextInteger(1, #fruitPool)]
+    table.insert(d.Fruits, fruit)
+
+    update(player, "Gacha result: " .. fruit .. " Fruit!")
+end
+
+local function store(player, fruit)
+    local d = getData(player)
+
+    if typeof(fruit) ~= "string" then return end
+
+    local index = table.find(d.Fruits, fruit)
+    if not index then
+        update(player, "Fruit not found in inventory.")
+        return
+    end
+
+    table.remove(d.Fruits, index)
+    table.insert(d.Stored, fruit)
+    update(player, "Stored " .. fruit .. " Fruit.")
+end
+
+Action.OnServerEvent:Connect(function(player, action, value)
+    local d = getData(player)
+
+    if action == "Start" then
+        if not d.Running then
+            d.Running = true
+            d.Paused = false
+            d.Status = "Farming"
+            d.Generation += 1
+
+            local generation = d.Generation
+            update(player, "Farm started!")
+
+            task.spawn(farm, player, generation)
+        elseif d.Paused then
+            d.Paused = false
+            d.Status = "Farming"
+            update(player, "Farm resumed.")
+        end
+
+    elseif action == "Pause" then
+        if d.Running then
+            d.Paused = true
+            d.Status = "Paused"
+            update(player, "Farm paused.")
+        end
+
+    elseif action == "Stop" then
+        d.Running = false
+        d.Paused = false
+        d.Status = "Stopped"
+        d.Generation += 1
+        removeEnemies(player)
+        update(player, "Farm stopped.")
+
+    elseif action == "Roll" then
+        roll(player)
+
+    elseif action == "Store" then
+        store(player, value)
+    end
+end)
+
+GetState.OnServerInvoke = function(player)
+    local d = getData(player)
+    return {
+        Candy = d.Candy,
+        Bits = d.Bits,
+        Defeated = d.Defeated,
+        Seeds = d.Seeds,
+        Fruits = d.Fruits,
+        Stored = d.Stored,
+        Rolls = #d.RollTimes,
+        Status = d.Status,
+        NextPumpkin = d.NextPumpkin,
+    }
+end
+
+Players.PlayerRemoving:Connect(function(player)
+    removeEnemies(player)
+    data[player] = nil
+end)
+
+print("Elites Halloween Farm V3 ready.")

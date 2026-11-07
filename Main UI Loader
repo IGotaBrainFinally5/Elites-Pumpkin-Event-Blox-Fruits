@@ -1,8 +1,17 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — client-side observer/helper (v3, max-compat rewrite)
+-- ELITES HALLOWEEN FARM — v4 (rendering fix)
 -- Delta Executor / Android / live Blox Fruits
--- Fixes applied: SourceSans fonts, no UIStroke, explicit border size, gethui/CoreGui/PlayerGui fallback,
--- guarded UI construction with warn() diagnostics, manual CanvasSize updates.
+-- Changes vs v3:
+--   * PlayerGui priority (was gethui-first) — fixes purple blob
+--   * IgnoreGuiInset = false (was true)
+--   * Content wrapper flattened — direct children of main
+--   * Aggressive purge across PlayerGui / CoreGui / gethui
+--   * Bright red loading banner proves ScreenGui rendering
+--   * Post-build AbsoluteSize validation
+--   * Thinner main border, explicit Visible/BackgroundTransparency on all frames
+--   * All v3 features preserved
+
+print("[EHF] v4 starting...")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -17,34 +26,59 @@ if not player then
     return
 end
 
--- GUI parent resolution (gethui > CoreGui > PlayerGui)
-local function resolveGuiParent()
-    local ok, hui = pcall(function()
-        return gethui and gethui()
+-- Purge any previous EHF ScreenGui from every possible parent
+local function purgeAll()
+    local parents = {}
+    local okPg, pg = pcall(function()
+        return player:FindFirstChild("PlayerGui")
     end)
-    if ok and hui then
-        warn("[EHF] Using gethui() as GUI parent.")
-        return hui
+    if okPg and pg then
+        table.insert(parents, pg)
     end
-    local ok2, core = pcall(function()
+    local okCg, cg = pcall(function()
         return CoreGui
     end)
-    if ok2 and core then
-        warn("[EHF] Using CoreGui as GUI parent.")
-        return core
+    if okCg and cg then
+        table.insert(parents, cg)
     end
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then
-        local ok3, res = pcall(function()
-            return player:WaitForChild("PlayerGui", 5)
-        end)
-        if ok3 then
-            pg = res
+    local okHui, hui = pcall(function()
+        return gethui and gethui()
+    end)
+    if okHui and hui then
+        table.insert(parents, hui)
+    end
+    for _, p in ipairs(parents) do
+        local old = p:FindFirstChild("ElitesHalloweenFarm")
+        if old then
+            old:Destroy()
+            warn("[EHF] Purged stale ElitesHalloweenFarm from " .. tostring(p))
         end
     end
-    if pg then
+end
+purgeAll()
+
+-- Resolve GUI parent: PlayerGui -> CoreGui -> gethui
+local function resolveGuiParent()
+    local okPg, pg = pcall(function()
+        return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5)
+    end)
+    if okPg and pg then
         warn("[EHF] Using PlayerGui as GUI parent.")
         return pg
+    end
+    local okCg, cg = pcall(function()
+        return CoreGui
+    end)
+    if okCg and cg then
+        warn("[EHF] Using CoreGui as GUI parent.")
+        return cg
+    end
+    local okHui, hui = pcall(function()
+        return gethui and gethui()
+    end)
+    if okHui and hui then
+        warn("[EHF] Using gethui() as GUI parent (fallback).")
+        return hui
     end
     return nil
 end
@@ -65,26 +99,37 @@ local CONFIG = {
 local THEME = {
     Background = Color3.fromRGB(18, 10, 26),
     Panel = Color3.fromRGB(32, 20, 48),
-    Button = Color3.fromRGB(58, 34, 88),
-    Border = Color3.fromRGB(98, 54, 150),
+    Button = Color3.fromRGB(68, 40, 104),
+    Border = Color3.fromRGB(108, 62, 168),
     Accent = Color3.fromRGB(160, 90, 255),
-    Text = Color3.fromRGB(240, 230, 255),
-    Muted = Color3.fromRGB(170, 150, 200),
+    Text = Color3.fromRGB(245, 238, 255),
+    Muted = Color3.fromRGB(180, 162, 210),
     Green = Color3.fromRGB(90, 230, 140),
     Red = Color3.fromRGB(255, 90, 110),
+    Danger = Color3.fromRGB(120, 40, 60),
 }
 
-local FONT_REG = Enum.Font.SourceSans
-local FONT_BOLD = Enum.Font.SourceSansBold
+local FONT_REG = Enum.Font.Arial
+local FONT_BOLD = Enum.Font.ArialBold
 do
     local ok1 = pcall(function()
         local f = Enum.Font.SourceSans
         assert(f ~= nil)
     end)
-    if not ok1 then
-        FONT_REG = Enum.Font.Arial
-        FONT_BOLD = Enum.Font.ArialBold
+    if ok1 then
+        FONT_REG = Enum.Font.SourceSans
+        FONT_BOLD = Enum.Font.SourceSansBold
     end
+end
+
+local function timestamp()
+    local ok, res = pcall(function()
+        return os.date("%H:%M:%S")
+    end)
+    if ok and res then
+        return res
+    end
+    return string.format("%.1f", os.clock())
 end
 
 local function fmt(v)
@@ -108,7 +153,7 @@ local function addLog(tag, msg)
     if not logEnabled and tag ~= "SYS" and tag ~= "ERROR" then
         return
     end
-    local line = string.format("%s [%s] %s", os.date("%H:%M:%S"), tostring(tag), tostring(msg))
+    local line = string.format("%s [%s] %s", timestamp(), tostring(tag), tostring(msg))
     table.insert(logLines, line)
     while #logLines > CONFIG.MAX_LOG_LINES do
         table.remove(logLines, 1)
@@ -134,26 +179,27 @@ local function addLog(tag, msg)
 end
 
 local function applyCorner(frame, radius)
-    local ok = pcall(function()
+    pcall(function()
         local c = Instance.new("UICorner")
         c.CornerRadius = UDim2.fromOffset(radius, radius)
         c.Parent = frame
     end)
-    return ok
 end
 
-local function applyBorder(frame, color)
-    frame.BorderSizePixel = 1
-    frame.BorderColor3 = color or THEME.Border
-end
-
-local function newFrame(parent, color, size, pos)
+local function makeFrame(parent, color, size, pos, name)
     local f = Instance.new("Frame")
+    if name then
+        f.Name = name
+    end
     f.BackgroundColor3 = color or THEME.Panel
-    f.BorderSizePixel = 0
+    f.BackgroundTransparency = 0
+    f.BorderSizePixel = 1
+    f.BorderColor3 = THEME.Border
+    f.Visible = true
     f.Size = size
     f.Position = pos
     f.Parent = parent
+    applyCorner(f, 8)
     return f
 end
 
@@ -161,13 +207,13 @@ local function makeLabel(parent, text, size, pos, textSize, color, bold)
     local l = Instance.new("TextLabel")
     l.BackgroundTransparency = 1
     l.BorderSizePixel = 0
-    l.BackgroundColor3 = Color3.new(0, 0, 0)
     l.Text = text
     l.TextColor3 = color or THEME.Text
     l.TextSize = textSize or 14
     l.Font = bold and FONT_BOLD or FONT_REG
     l.TextXAlignment = Enum.TextXAlignment.Left
     l.TextYAlignment = Enum.TextYAlignment.Top
+    l.Visible = true
     l.Size = size
     l.Position = pos
     l.Parent = parent
@@ -178,12 +224,14 @@ local function makeButton(parent, text, size, pos)
     local b = Instance.new("TextButton")
     b.Text = text
     b.TextColor3 = THEME.Text
-    b.Font = FONT_REG
+    b.Font = FONT_BOLD
     b.TextSize = 14
     b.AutoButtonColor = false
     b.BackgroundColor3 = THEME.Button
+    b.BackgroundTransparency = 0
     b.BorderSizePixel = 1
     b.BorderColor3 = THEME.Border
+    b.Visible = true
     b.Size = size
     b.Position = pos
     b.Parent = parent
@@ -191,22 +239,20 @@ local function makeButton(parent, text, size, pos)
     return b
 end
 
-local function buildUI()
-    -- Clear previous
-    for _, parent in ipairs({ guiParent }) do
-        local old = parent:FindFirstChild("ElitesHalloweenFarm")
-        if old then
-            old:Destroy()
-        end
-    end
-    local oldPg = player:FindFirstChild("PlayerGui")
-    if oldPg then
-        local old = oldPg:FindFirstChild("ElitesHalloweenFarm")
-        if old then
-            old:Destroy()
-        end
-    end
+-- =========================================================
+-- Build UI
+-- =========================================================
 
+local screenGui
+local main
+local header
+local headerH = 44
+local featureScroll
+local startAllBtn, stopAllBtn, loggingBtn, clearBtn, copyBtn, buyGachaBtn
+local minBtn, closeBtn
+local contentTop
+
+local function buildUI()
     local viewport
     local cam = Workspace.CurrentCamera
     if cam then
@@ -218,110 +264,145 @@ local function buildUI()
 
     local mainW = math.clamp(viewport.X - 24, 320, 420)
     local mainH = math.clamp(viewport.Y - 60, 400, 560)
-    local headerH = 44
-    local contentH = mainH - headerH - 10
+    warn(string.format("[EHF] Viewport=%dx%d main=%dx%d", viewport.X, viewport.Y, mainW, mainH))
 
-    warn(string.format("[EHF] Viewport=%dx%d, main=%dx%d", viewport.X, viewport.Y, mainW, mainH))
-
-    local screenGui = Instance.new("ScreenGui")
+    screenGui = Instance.new("ScreenGui")
     screenGui.Name = "ElitesHalloweenFarm"
     screenGui.ResetOnSpawn = false
-    screenGui.IgnoreGuiInset = true
-    screenGui.DisplayOrder = 9999
+    screenGui.IgnoreGuiInset = false
+    screenGui.DisplayOrder = 999999
+    screenGui.Enabled = true
 
     local okParent, errParent = pcall(function()
         screenGui.Parent = guiParent
     end)
     if not okParent then
-        warn("[EHF] Failed to parent ScreenGui: " .. tostring(errParent))
-        return nil
+        error("Failed to parent ScreenGui: " .. tostring(errParent))
     end
-    screenGui.Enabled = true
+    warn("[EHF] ScreenGui parented to " .. tostring(guiParent:GetFullName()))
 
-    local main = Instance.new("Frame")
+    -- Bright red loading banner proves ScreenGui rendering works
+    local banner = Instance.new("Frame")
+    banner.Name = "EHF_LoadingBanner"
+    banner.Size = UDim2.fromOffset(220, 60)
+    banner.Position = UDim2.new(0.5, -110, 0, 60)
+    banner.BackgroundColor3 = Color3.fromRGB(255, 0, 40)
+    banner.BorderSizePixel = 0
+    banner.ZIndex = 100
+    banner.Parent = screenGui
+    applyCorner(banner, 10)
+
+    local bannerLabel = Instance.new("TextLabel")
+    bannerLabel.BackgroundTransparency = 1
+    bannerLabel.Text = "EHF LOADING"
+    bannerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    bannerLabel.TextSize = 22
+    bannerLabel.Font = FONT_BOLD
+    bannerLabel.Size = UDim2.new(1, 0, 1, 0)
+    bannerLabel.ZIndex = 101
+    bannerLabel.Parent = banner
+
+    main = Instance.new("Frame")
     main.Name = "Main"
     main.BackgroundColor3 = THEME.Background
-    main.BorderSizePixel = 2
+    main.BackgroundTransparency = 0
+    main.BorderSizePixel = 1
     main.BorderColor3 = THEME.Accent
-    main.Position = UDim2.new(0.5, 0, 0.5, 0)
     main.AnchorPoint = Vector2.new(0.5, 0.5)
+    main.Position = UDim2.new(0.5, 0, 0.5, 0)
     main.Size = UDim2.fromOffset(mainW, mainH)
+    main.ClipsDescendants = true
+    main.Visible = true
+    main.ZIndex = 2
     main.Parent = screenGui
     applyCorner(main, 14)
 
-    local header = newFrame(main, THEME.Panel, UDim2.new(1, 0, 0, headerH), UDim2.fromOffset(0, 0))
-    applyCorner(header, 14)
-    applyBorder(header, THEME.Border)
+    header = makeFrame(main, THEME.Panel, UDim2.new(1, 0, 0, headerH), UDim2.fromOffset(0, 0), "Header")
+    header.ZIndex = 3
+    header.BorderColor3 = THEME.Border
 
     local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
+    title.ZIndex = 4
     local subtitle = makeLabel(header, "Client observer — no fake remotes or rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+    subtitle.ZIndex = 4
 
-    local minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
-    local closeBtn = makeButton(header, "X", UDim2.fromOffset(26, 26), UDim2.new(1, -32, 0, 9))
-    closeBtn.BackgroundColor3 = Color3.fromRGB(92, 30, 48)
+    minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
+    minBtn.ZIndex = 5
+    closeBtn = makeButton(header, "X", UDim2.fromOffset(26, 26), UDim2.new(1, -32, 0, 9))
+    closeBtn.BackgroundColor3 = THEME.Danger
+    closeBtn.ZIndex = 5
 
-    local content = newFrame(main, THEME.Background, UDim2.new(1, -12, 1, -headerH - 10), UDim2.fromOffset(6, headerH + 4))
-    content.BackgroundTransparency = 1
+    contentTop = headerH + 4
+    local contentLeft = 6
+    local contentWidth = mainW - 12
+    local contentBottom = mainH - 6
+    local contentHeight = contentBottom - contentTop
 
-    local toolbar = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, 66), UDim2.fromOffset(0, 0))
-    applyCorner(toolbar, 10)
-    applyBorder(toolbar, THEME.Border)
+    local toolbar = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, 66), UDim2.fromOffset(contentLeft, contentTop), "Toolbar")
+    toolbar.ZIndex = 3
 
-    local startAllBtn = makeButton(toolbar, "Start All", UDim2.fromOffset(84, 28), UDim2.fromOffset(4, 4))
-    local stopAllBtn = makeButton(toolbar, "Stop All", UDim2.fromOffset(84, 28), UDim2.fromOffset(92, 4))
-    local loggingBtn = makeButton(toolbar, "Logging: ON", UDim2.fromOffset(108, 28), UDim2.fromOffset(180, 4))
+    startAllBtn = makeButton(toolbar, "Start All", UDim2.fromOffset(84, 28), UDim2.fromOffset(4, 4))
+    startAllBtn.ZIndex = 5
+    stopAllBtn = makeButton(toolbar, "Stop All", UDim2.fromOffset(84, 28), UDim2.fromOffset(92, 4))
+    stopAllBtn.ZIndex = 5
+    loggingBtn = makeButton(toolbar, "Logging: ON", UDim2.fromOffset(108, 28), UDim2.fromOffset(180, 4))
+    loggingBtn.ZIndex = 5
 
-    local clearBtn = makeButton(toolbar, "Clear Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(4, 36))
-    local copyBtn = makeButton(toolbar, "Copy Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(92, 36))
-    local buyGachaBtn = makeButton(toolbar, "Buy Gacha", UDim2.fromOffset(108, 26), UDim2.fromOffset(180, 36))
-    buyGachaBtn.BackgroundColor3 = Color3.fromRGB(70, 40, 60)
+    clearBtn = makeButton(toolbar, "Clear Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(4, 36))
+    clearBtn.ZIndex = 5
+    copyBtn = makeButton(toolbar, "Copy Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(92, 36))
+    copyBtn.ZIndex = 5
+    buyGachaBtn = makeButton(toolbar, "Buy Gacha", UDim2.fromOffset(108, 26), UDim2.fromOffset(180, 36))
+    buyGachaBtn.BackgroundColor3 = Color3.fromRGB(80, 46, 70)
+    buyGachaBtn.ZIndex = 5
 
-    local featureY = 72
+    local featureY = contentTop + 72
     local summaryH = 50
     local logMinH = 80
-
-    local featureH = contentH - featureY - summaryH - logMinH - 12
+    local featureH = contentHeight - 72 - summaryH - logMinH - 12
     if featureH < 100 then
         featureH = 100
     end
-
     local summaryY = featureY + featureH + 6
     local logY = summaryY + summaryH + 6
-    local logH = contentH - logY - 4
+    local logH = contentBottom - logY
     if logH < 60 then
         logH = 60
     end
 
-    local featureScroll = Instance.new("ScrollingFrame")
+    featureScroll = Instance.new("ScrollingFrame")
+    featureScroll.Name = "FeatureList"
     featureScroll.BackgroundColor3 = THEME.Panel
+    featureScroll.BackgroundTransparency = 0
     featureScroll.BorderSizePixel = 1
     featureScroll.BorderColor3 = THEME.Border
-    featureScroll.Position = UDim2.fromOffset(0, featureY)
-    featureScroll.Size = UDim2.new(1, 0, 0, featureH)
+    featureScroll.Visible = true
+    featureScroll.Position = UDim2.fromOffset(contentLeft, featureY)
+    featureScroll.Size = UDim2.fromOffset(contentWidth, featureH)
     featureScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
     featureScroll.ScrollBarThickness = 6
     featureScroll.ScrollBarImageColor3 = THEME.Accent
-    featureScroll.Parent = content
-    applyCorner(featureScroll, 10)
+    featureScroll.ZIndex = 3
+    featureScroll.Parent = main
+    applyCorner(featureScroll, 8)
 
     local featureLayout = Instance.new("UIListLayout")
     featureLayout.Padding = UDim.new(0, 6)
     featureLayout.SortOrder = Enum.SortOrder.LayoutOrder
     featureLayout.Parent = featureScroll
 
-    local summary = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, summaryH), UDim2.fromOffset(0, summaryY))
-    applyCorner(summary, 10)
-    applyBorder(summary, THEME.Border)
-
+    local summary = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, summaryH), UDim2.fromOffset(contentLeft, summaryY), "Summary")
+    summary.ZIndex = 3
     local summaryTitle = makeLabel(summary, "LOCAL STATUS", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
+    summaryTitle.ZIndex = 4
     summaryStatus = makeLabel(summary, "No features running.", UDim2.new(1, -16, 0, 18), UDim2.fromOffset(8, 24), 11, THEME.Muted, false)
+    summaryStatus.ZIndex = 4
     summaryStatus.TextWrapped = true
 
-    local logFrame = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, logH), UDim2.fromOffset(0, logY))
-    applyCorner(logFrame, 10)
-    applyBorder(logFrame, THEME.Border)
-
+    local logFrame = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, logH), UDim2.fromOffset(contentLeft, logY), "LogFrame")
+    logFrame.ZIndex = 3
     local logTitle = makeLabel(logFrame, "ACTIVITY LOG", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
+    logTitle.ZIndex = 4
 
     logScroll = Instance.new("ScrollingFrame")
     logScroll.BackgroundTransparency = 1
@@ -331,6 +412,7 @@ local function buildUI()
     logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
     logScroll.ScrollBarThickness = 5
     logScroll.ScrollBarImageColor3 = THEME.Accent
+    logScroll.ZIndex = 4
     logScroll.Parent = logFrame
 
     logLabel = Instance.new("TextLabel")
@@ -345,48 +427,46 @@ local function buildUI()
     logLabel.TextWrapped = true
     logLabel.Size = UDim2.new(1, -8, 0, 16)
     logLabel.Position = UDim2.fromOffset(0, 0)
+    logLabel.ZIndex = 5
     logLabel.Parent = logScroll
 
     warn("[EHF] Base UI built.")
-    return {
-        screenGui = screenGui,
-        main = main,
-        content = content,
-        header = header,
-        headerH = headerH,
-        featureScroll = featureScroll,
-        startAllBtn = startAllBtn,
-        stopAllBtn = stopAllBtn,
-        loggingBtn = loggingBtn,
-        clearBtn = clearBtn,
-        copyBtn = copyBtn,
-        buyGachaBtn = buyGachaBtn,
-        minBtn = minBtn,
-        closeBtn = closeBtn,
-        viewport = viewport,
-    }
+
+    task.delay(2, function()
+        if banner and banner.Parent then
+            banner:Destroy()
+            warn("[EHF] Loading banner removed.")
+        end
+    end)
+
+    task.delay(0.5, function()
+        local ok, abs = pcall(function()
+            return main.AbsoluteSize
+        end)
+        if ok and abs then
+            warn(string.format("[EHF] main.AbsoluteSize = %dx%d", abs.X, abs.Y))
+            if abs.X < 100 or abs.Y < 100 then
+                warn("[EHF] WARNING: main is very small — GUI parent may be mis-sized.")
+            end
+        end
+    end)
 end
 
-local okBuild, uiOrErr = pcall(buildUI)
-if not okBuild or not uiOrErr then
-    warn("[EHF] UI construction failed: " .. tostring(uiOrErr))
+local okBuild, errBuild = pcall(buildUI)
+if not okBuild or not screenGui then
+    warn("[EHF] UI construction failed: " .. tostring(errBuild))
+    if guiParent then
+        local orphan = guiParent:FindFirstChild("ElitesHalloweenFarm")
+        if orphan then
+            orphan:Destroy()
+        end
+    end
     return
 end
-local ui = uiOrErr
-local screenGui = ui.screenGui
-local main = ui.main
-local content = ui.content
-local header = ui.header
-local headerH = ui.headerH
-local featureScroll = ui.featureScroll
-local startAllBtn = ui.startAllBtn
-local stopAllBtn = ui.stopAllBtn
-local loggingBtn = ui.loggingBtn
-local clearBtn = ui.clearBtn
-local copyBtn = ui.copyBtn
-local buyGachaBtn = ui.buyGachaBtn
-local minBtn = ui.minBtn
-local closeBtn = ui.closeBtn
+
+-- =========================================================
+-- Feature registry
+-- =========================================================
 
 local features = {}
 local featureOrder = {}
@@ -453,25 +533,33 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
     row.Name = id
     row.Size = UDim2.new(1, -8, 0, 60)
     row.BackgroundColor3 = THEME.Panel
+    row.BackgroundTransparency = 0
     row.BorderSizePixel = 1
     row.BorderColor3 = THEME.Border
+    row.Visible = true
+    row.ZIndex = 4
     row.Parent = featureScroll
     applyCorner(row, 8)
 
     local titleLabel = makeLabel(row, name, UDim2.new(1, -150, 0, 18), UDim2.fromOffset(10, 5), 13, THEME.Text, true)
+    titleLabel.ZIndex = 5
     titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
     local descLabel = makeLabel(row, desc, UDim2.new(1, -150, 0, 16), UDim2.fromOffset(10, 23), 10, THEME.Muted, false)
+    descLabel.ZIndex = 5
     descLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
     local statusLabel = makeLabel(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted, false)
+    statusLabel.ZIndex = 5
     statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
     local btn = makeButton(row, "Start", UDim2.fromOffset(64, 28), UDim2.new(1, -74, 0, 5))
+    btn.ZIndex = 6
 
     if extraText then
         local extraBtn = makeButton(row, extraText, UDim2.fromOffset(64, 22), UDim2.new(1, -74, 0, 35))
         extraBtn.TextSize = 10
+        extraBtn.ZIndex = 6
         extraBtn.MouseButton1Click:Connect(function()
             if extraCallback then
                 local ok, err = pcall(extraCallback)
@@ -504,6 +592,10 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
     return f
 end
 
+-- =========================================================
+-- Remote lookup
+-- =========================================================
+
 local function getNet()
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     if not modules then
@@ -528,7 +620,9 @@ local function getGachaRF()
     return net and net:FindFirstChild("RF/GachaNetworkRF")
 end
 
+-- =========================================================
 -- Pumpkin tracker
+-- =========================================================
 
 local pumpkinSeen = {}
 local pumpkinLastCount = 0
@@ -586,7 +680,9 @@ local function pumpkinTick()
     end
 end
 
+-- =========================================================
 -- Material scanner
+-- =========================================================
 
 local MATERIAL_KEYWORDS = { "candy", "corn", "pumpkin", "bit", "seed", "treat", "halloween", "spooky", "soul", "bone" }
 
@@ -669,7 +765,9 @@ local function materialTick()
     setFeatureStatus("materials", tostring(count) .. " readable value(s)")
 end
 
+-- =========================================================
 -- Event keyword observer
+-- =========================================================
 
 local EVENT_KEYWORDS = { "trick", "treat", "dapper", "cursed", "seed", "spooky", "jack", "pumpkin", "halloween" }
 local eventLast = {}
@@ -733,7 +831,9 @@ local function eventTick()
     setFeatureStatus("events", tostring(count) .. " keyword object(s)")
 end
 
+-- =========================================================
 -- Gacha monitor
+-- =========================================================
 
 local gachaLastPresent = nil
 
@@ -796,7 +896,9 @@ local function requestGachaPurchase()
     end
 end
 
+-- =========================================================
 -- Fruit observer
+-- =========================================================
 
 local fruitLastString = nil
 
@@ -831,7 +933,9 @@ local function fruitTick()
     setFeatureStatus("fruits", tostring(#list) .. " tool(s)")
 end
 
+-- =========================================================
 -- Respawn countdown
+-- =========================================================
 
 local function respawnStart()
     addLog("RESPAWN", "Respawn countdown started (observed 690s estimate).")
@@ -855,7 +959,9 @@ local function respawnTick()
     end
 end
 
+-- =========================================================
 -- Diagnostics
+-- =========================================================
 
 local DIAG_PATHS = {
     { "Remotes", "OnTalkToNPC" },
@@ -899,7 +1005,9 @@ local function diagTick()
     runDiagnostics(false)
 end
 
+-- =========================================================
 -- Register features
+-- =========================================================
 
 addFeature("pumpkin", "Pumpkin Tracker", "Watches workspace.PumpkinHunt for pumpkin models.", pumpkinStart, nil, pumpkinTick)
 addFeature("materials", "Material Scanner", "Reads local attributes, leaderstats, tools.", materialStart, nil, materialTick)
@@ -909,7 +1017,9 @@ addFeature("fruits", "Fruit Inventory Observer", "Lists Backpack/Character tool 
 addFeature("respawn", "Respawn Countdown", "Local 690s estimate after pumpkin disappears.", respawnStart, nil, respawnTick)
 addFeature("diag", "Remote Diagnostics", "Reports which captured remotes exist.", diagStart, nil, diagTick)
 
+-- =========================================================
 -- Main loop
+-- =========================================================
 
 task.spawn(function()
     while screenGui and screenGui.Parent do
@@ -927,7 +1037,9 @@ task.spawn(function()
     end
 end)
 
+-- =========================================================
 -- UI actions
+-- =========================================================
 
 startAllBtn.MouseButton1Click:Connect(function()
     addLog("FEATURE", "Start All requested.")
@@ -985,11 +1097,9 @@ minBtn.MouseButton1Click:Connect(function()
     if minimized then
         savedSize = main.Size
         main.Size = UDim2.new(savedSize.X.Scale, savedSize.X.Offset, 0, headerH)
-        content.Visible = false
         minBtn.Text = "□"
     else
         main.Size = savedSize
-        content.Visible = true
         minBtn.Text = "—"
     end
 end)
@@ -1001,7 +1111,6 @@ closeBtn.MouseButton1Click:Connect(function()
 end)
 
 -- Dragging
-
 local dragging = false
 local dragStart = nil
 local startPos = nil
@@ -1035,7 +1144,7 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
-addLog("SYS", "ELITES HALLOWEEN FARM loaded. No fake remotes, enemies, rewards, or currencies.")
+addLog("SYS", "ELITES HALLOWEEN FARM v4 loaded. No fake remotes, enemies, rewards, or currencies.")
 addLog("SYS", "Client-side observer only. Server still validates real actions.")
 updateSummary()
-warn("[EHF] GUI loaded successfully.")
+warn("[EHF] v4 GUI loaded successfully.")

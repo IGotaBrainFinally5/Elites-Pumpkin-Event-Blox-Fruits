@@ -1,14 +1,15 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — client-side observer/helper (rewrite)
+-- ELITES HALLOWEEN FARM — client-side observer/helper (v3, max-compat rewrite)
 -- Delta Executor / Android / live Blox Fruits
--- No fake remotes, rewards, enemies, or gacha rolls.
--- If something fails, check the Roblox dev console / Delta output for warnings prefixed [EHF].
+-- Fixes applied: SourceSans fonts, no UIStroke, explicit border size, gethui/CoreGui/PlayerGui fallback,
+-- guarded UI construction with warn() diagnostics, manual CanvasSize updates.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
 if not player then
@@ -16,17 +17,41 @@ if not player then
     return
 end
 
-local playerGui = player:FindFirstChild("PlayerGui")
-if not playerGui then
-    local ok, res = pcall(function()
-        return player:WaitForChild("PlayerGui", 5)
+-- GUI parent resolution (gethui > CoreGui > PlayerGui)
+local function resolveGuiParent()
+    local ok, hui = pcall(function()
+        return gethui and gethui()
     end)
-    if ok then
-        playerGui = res
+    if ok and hui then
+        warn("[EHF] Using gethui() as GUI parent.")
+        return hui
     end
+    local ok2, core = pcall(function()
+        return CoreGui
+    end)
+    if ok2 and core then
+        warn("[EHF] Using CoreGui as GUI parent.")
+        return core
+    end
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then
+        local ok3, res = pcall(function()
+            return player:WaitForChild("PlayerGui", 5)
+        end)
+        if ok3 then
+            pg = res
+        end
+    end
+    if pg then
+        warn("[EHF] Using PlayerGui as GUI parent.")
+        return pg
+    end
+    return nil
 end
-if not playerGui then
-    warn("[EHF] Could not find PlayerGui.")
+
+local guiParent = resolveGuiParent()
+if not guiParent then
+    warn("[EHF] Could not resolve any GUI parent.")
     return
 end
 
@@ -48,6 +73,19 @@ local THEME = {
     Green = Color3.fromRGB(90, 230, 140),
     Red = Color3.fromRGB(255, 90, 110),
 }
+
+local FONT_REG = Enum.Font.SourceSans
+local FONT_BOLD = Enum.Font.SourceSansBold
+do
+    local ok1 = pcall(function()
+        local f = Enum.Font.SourceSans
+        assert(f ~= nil)
+    end)
+    if not ok1 then
+        FONT_REG = Enum.Font.Arial
+        FONT_BOLD = Enum.Font.ArialBold
+    end
+end
 
 local function fmt(v)
     if type(v) == "table" then
@@ -95,19 +133,18 @@ local function addLog(tag, msg)
     end
 end
 
-local function corner(parent, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim2.fromOffset(radius, radius)
-    c.Parent = parent
-    return c
+local function applyCorner(frame, radius)
+    local ok = pcall(function()
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim2.fromOffset(radius, radius)
+        c.Parent = frame
+    end)
+    return ok
 end
 
-local function stroke(parent, color, thickness)
-    local s = Instance.new("UIStroke")
-    s.Color = color or THEME.Border
-    s.Thickness = thickness or 1
-    s.Parent = parent
-    return s
+local function applyBorder(frame, color)
+    frame.BorderSizePixel = 1
+    frame.BorderColor3 = color or THEME.Border
 end
 
 local function newFrame(parent, color, size, pos)
@@ -120,14 +157,15 @@ local function newFrame(parent, color, size, pos)
     return f
 end
 
-local function makeLabel(parent, text, size, pos, textSize, color)
+local function makeLabel(parent, text, size, pos, textSize, color, bold)
     local l = Instance.new("TextLabel")
     l.BackgroundTransparency = 1
     l.BorderSizePixel = 0
+    l.BackgroundColor3 = Color3.new(0, 0, 0)
     l.Text = text
     l.TextColor3 = color or THEME.Text
     l.TextSize = textSize or 14
-    l.Font = Enum.Font.Gotham
+    l.Font = bold and FONT_BOLD or FONT_REG
     l.TextXAlignment = Enum.TextXAlignment.Left
     l.TextYAlignment = Enum.TextYAlignment.Top
     l.Size = size
@@ -140,36 +178,36 @@ local function makeButton(parent, text, size, pos)
     local b = Instance.new("TextButton")
     b.Text = text
     b.TextColor3 = THEME.Text
-    b.Font = Enum.Font.Gotham
+    b.Font = FONT_REG
     b.TextSize = 14
     b.AutoButtonColor = false
     b.BackgroundColor3 = THEME.Button
-    b.BorderSizePixel = 0
+    b.BorderSizePixel = 1
+    b.BorderColor3 = THEME.Border
     b.Size = size
     b.Position = pos
     b.Parent = parent
-    corner(b, 8)
-    stroke(b, THEME.Border, 1)
+    applyCorner(b, 8)
     return b
 end
 
--- Clean any previous instance in playerGui
-local old = playerGui:FindFirstChild("ElitesHalloweenFarm")
-if old then
-    old:Destroy()
-end
+local function buildUI()
+    -- Clear previous
+    for _, parent in ipairs({ guiParent }) do
+        local old = parent:FindFirstChild("ElitesHalloweenFarm")
+        if old then
+            old:Destroy()
+        end
+    end
+    local oldPg = player:FindFirstChild("PlayerGui")
+    if oldPg then
+        local old = oldPg:FindFirstChild("ElitesHalloweenFarm")
+        if old then
+            old:Destroy()
+        end
+    end
 
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "ElitesHalloweenFarm"
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.DisplayOrder = 9999
-screenGui.Enabled = true
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent = playerGui
-
-local viewport
-do
+    local viewport
     local cam = Workspace.CurrentCamera
     if cam then
         viewport = cam.ViewportSize
@@ -177,127 +215,178 @@ do
     if not viewport or viewport.X < 100 or viewport.Y < 100 then
         viewport = Vector2.new(720, 1280)
     end
+
+    local mainW = math.clamp(viewport.X - 24, 320, 420)
+    local mainH = math.clamp(viewport.Y - 60, 400, 560)
+    local headerH = 44
+    local contentH = mainH - headerH - 10
+
+    warn(string.format("[EHF] Viewport=%dx%d, main=%dx%d", viewport.X, viewport.Y, mainW, mainH))
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "ElitesHalloweenFarm"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 9999
+
+    local okParent, errParent = pcall(function()
+        screenGui.Parent = guiParent
+    end)
+    if not okParent then
+        warn("[EHF] Failed to parent ScreenGui: " .. tostring(errParent))
+        return nil
+    end
+    screenGui.Enabled = true
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.BackgroundColor3 = THEME.Background
+    main.BorderSizePixel = 2
+    main.BorderColor3 = THEME.Accent
+    main.Position = UDim2.new(0.5, 0, 0.5, 0)
+    main.AnchorPoint = Vector2.new(0.5, 0.5)
+    main.Size = UDim2.fromOffset(mainW, mainH)
+    main.Parent = screenGui
+    applyCorner(main, 14)
+
+    local header = newFrame(main, THEME.Panel, UDim2.new(1, 0, 0, headerH), UDim2.fromOffset(0, 0))
+    applyCorner(header, 14)
+    applyBorder(header, THEME.Border)
+
+    local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
+    local subtitle = makeLabel(header, "Client observer — no fake remotes or rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+
+    local minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
+    local closeBtn = makeButton(header, "X", UDim2.fromOffset(26, 26), UDim2.new(1, -32, 0, 9))
+    closeBtn.BackgroundColor3 = Color3.fromRGB(92, 30, 48)
+
+    local content = newFrame(main, THEME.Background, UDim2.new(1, -12, 1, -headerH - 10), UDim2.fromOffset(6, headerH + 4))
+    content.BackgroundTransparency = 1
+
+    local toolbar = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, 66), UDim2.fromOffset(0, 0))
+    applyCorner(toolbar, 10)
+    applyBorder(toolbar, THEME.Border)
+
+    local startAllBtn = makeButton(toolbar, "Start All", UDim2.fromOffset(84, 28), UDim2.fromOffset(4, 4))
+    local stopAllBtn = makeButton(toolbar, "Stop All", UDim2.fromOffset(84, 28), UDim2.fromOffset(92, 4))
+    local loggingBtn = makeButton(toolbar, "Logging: ON", UDim2.fromOffset(108, 28), UDim2.fromOffset(180, 4))
+
+    local clearBtn = makeButton(toolbar, "Clear Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(4, 36))
+    local copyBtn = makeButton(toolbar, "Copy Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(92, 36))
+    local buyGachaBtn = makeButton(toolbar, "Buy Gacha", UDim2.fromOffset(108, 26), UDim2.fromOffset(180, 36))
+    buyGachaBtn.BackgroundColor3 = Color3.fromRGB(70, 40, 60)
+
+    local featureY = 72
+    local summaryH = 50
+    local logMinH = 80
+
+    local featureH = contentH - featureY - summaryH - logMinH - 12
+    if featureH < 100 then
+        featureH = 100
+    end
+
+    local summaryY = featureY + featureH + 6
+    local logY = summaryY + summaryH + 6
+    local logH = contentH - logY - 4
+    if logH < 60 then
+        logH = 60
+    end
+
+    local featureScroll = Instance.new("ScrollingFrame")
+    featureScroll.BackgroundColor3 = THEME.Panel
+    featureScroll.BorderSizePixel = 1
+    featureScroll.BorderColor3 = THEME.Border
+    featureScroll.Position = UDim2.fromOffset(0, featureY)
+    featureScroll.Size = UDim2.new(1, 0, 0, featureH)
+    featureScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    featureScroll.ScrollBarThickness = 6
+    featureScroll.ScrollBarImageColor3 = THEME.Accent
+    featureScroll.Parent = content
+    applyCorner(featureScroll, 10)
+
+    local featureLayout = Instance.new("UIListLayout")
+    featureLayout.Padding = UDim.new(0, 6)
+    featureLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    featureLayout.Parent = featureScroll
+
+    local summary = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, summaryH), UDim2.fromOffset(0, summaryY))
+    applyCorner(summary, 10)
+    applyBorder(summary, THEME.Border)
+
+    local summaryTitle = makeLabel(summary, "LOCAL STATUS", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
+    summaryStatus = makeLabel(summary, "No features running.", UDim2.new(1, -16, 0, 18), UDim2.fromOffset(8, 24), 11, THEME.Muted, false)
+    summaryStatus.TextWrapped = true
+
+    local logFrame = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, logH), UDim2.fromOffset(0, logY))
+    applyCorner(logFrame, 10)
+    applyBorder(logFrame, THEME.Border)
+
+    local logTitle = makeLabel(logFrame, "ACTIVITY LOG", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent, true)
+
+    logScroll = Instance.new("ScrollingFrame")
+    logScroll.BackgroundTransparency = 1
+    logScroll.BorderSizePixel = 0
+    logScroll.Position = UDim2.fromOffset(6, 24)
+    logScroll.Size = UDim2.new(1, -12, 1, -28)
+    logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    logScroll.ScrollBarThickness = 5
+    logScroll.ScrollBarImageColor3 = THEME.Accent
+    logScroll.Parent = logFrame
+
+    logLabel = Instance.new("TextLabel")
+    logLabel.BackgroundTransparency = 1
+    logLabel.BorderSizePixel = 0
+    logLabel.Text = ""
+    logLabel.TextColor3 = THEME.Text
+    logLabel.TextSize = 11
+    logLabel.Font = FONT_REG
+    logLabel.TextXAlignment = Enum.TextXAlignment.Left
+    logLabel.TextYAlignment = Enum.TextYAlignment.Top
+    logLabel.TextWrapped = true
+    logLabel.Size = UDim2.new(1, -8, 0, 16)
+    logLabel.Position = UDim2.fromOffset(0, 0)
+    logLabel.Parent = logScroll
+
+    warn("[EHF] Base UI built.")
+    return {
+        screenGui = screenGui,
+        main = main,
+        content = content,
+        header = header,
+        headerH = headerH,
+        featureScroll = featureScroll,
+        startAllBtn = startAllBtn,
+        stopAllBtn = stopAllBtn,
+        loggingBtn = loggingBtn,
+        clearBtn = clearBtn,
+        copyBtn = copyBtn,
+        buyGachaBtn = buyGachaBtn,
+        minBtn = minBtn,
+        closeBtn = closeBtn,
+        viewport = viewport,
+    }
 end
 
-local mainW = math.clamp(viewport.X - 24, 320, 420)
-local mainH = math.clamp(viewport.Y - 60, 400, 560)
-local headerH = 44
-local contentH = mainH - headerH - 10
-
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.BackgroundColor3 = THEME.Background
-main.BorderSizePixel = 0
-main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.AnchorPoint = Vector2.new(0.5, 0.5)
-main.Size = UDim2.fromOffset(mainW, mainH)
-main.ClipsDescendants = true
-main.Parent = screenGui
-corner(main, 14)
-stroke(main, THEME.Accent, 2)
-
-local header = newFrame(main, THEME.Panel, UDim2.new(1, 0, 0, headerH), UDim2.fromOffset(0, 0))
-corner(header, 14)
-stroke(header, THEME.Border, 1)
-
-local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text)
-title.Font = Enum.Font.GothamBold
-
-local subtitle = makeLabel(header, "Client observer — no fake remotes or rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted)
-
-local minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
-local closeBtn = makeButton(header, "X", UDim2.fromOffset(26, 26), UDim2.new(1, -32, 0, 9))
-closeBtn.BackgroundColor3 = Color3.fromRGB(92, 30, 48)
-
-local content = newFrame(main, THEME.Background, UDim2.new(1, -12, 1, -headerH - 10), UDim2.fromOffset(6, headerH + 4))
-content.BackgroundTransparency = 1
-
-local toolbar = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, 66), UDim2.fromOffset(0, 0))
-corner(toolbar, 10)
-stroke(toolbar, THEME.Border, 1)
-
-local startAllBtn = makeButton(toolbar, "Start All", UDim2.fromOffset(84, 28), UDim2.fromOffset(4, 4))
-local stopAllBtn = makeButton(toolbar, "Stop All", UDim2.fromOffset(84, 28), UDim2.fromOffset(92, 4))
-local loggingBtn = makeButton(toolbar, "Logging: ON", UDim2.fromOffset(108, 28), UDim2.fromOffset(180, 4))
-
-local clearBtn = makeButton(toolbar, "Clear Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(4, 36))
-local copyBtn = makeButton(toolbar, "Copy Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(92, 36))
-local buyGachaBtn = makeButton(toolbar, "Buy Gacha", UDim2.fromOffset(108, 26), UDim2.fromOffset(180, 36))
-buyGachaBtn.BackgroundColor3 = Color3.fromRGB(70, 40, 60)
-
-local featureY = 72
-local summaryH = 50
-local logMinH = 80
-
-local featureH = contentH - featureY - summaryH - logMinH - 12
-if featureH < 100 then
-    featureH = 100
+local okBuild, uiOrErr = pcall(buildUI)
+if not okBuild or not uiOrErr then
+    warn("[EHF] UI construction failed: " .. tostring(uiOrErr))
+    return
 end
-
-local summaryY = featureY + featureH + 6
-local logY = summaryY + summaryH + 6
-local logH = contentH - logY - 4
-if logH < 60 then
-    logH = 60
-end
-
-local featureScroll = Instance.new("ScrollingFrame")
-featureScroll.BackgroundColor3 = THEME.Panel
-featureScroll.BorderSizePixel = 0
-featureScroll.Position = UDim2.fromOffset(0, featureY)
-featureScroll.Size = UDim2.new(1, 0, 0, featureH)
-featureScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-featureScroll.ScrollBarThickness = 6
-featureScroll.ScrollBarImageColor3 = THEME.Accent
-featureScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-featureScroll.Parent = content
-corner(featureScroll, 10)
-stroke(featureScroll, THEME.Border, 1)
-
-local featureLayout = Instance.new("UIListLayout")
-featureLayout.Padding = UDim.new(0, 6)
-featureLayout.SortOrder = Enum.SortOrder.LayoutOrder
-featureLayout.Parent = featureScroll
-
-local summary = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, summaryH), UDim2.fromOffset(0, summaryY))
-corner(summary, 10)
-stroke(summary, THEME.Border, 1)
-
-local summaryTitle = makeLabel(summary, "LOCAL STATUS", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent)
-summaryTitle.Font = Enum.Font.GothamBold
-summaryStatus = makeLabel(summary, "No features running.", UDim2.new(1, -16, 0, 18), UDim2.fromOffset(8, 24), 11, THEME.Muted)
-summaryStatus.TextWrapped = true
-
-local logFrame = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, logH), UDim2.fromOffset(0, logY))
-corner(logFrame, 10)
-stroke(logFrame, THEME.Border, 1)
-
-local logTitle = makeLabel(logFrame, "ACTIVITY LOG", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent)
-logTitle.Font = Enum.Font.GothamBold
-
-logScroll = Instance.new("ScrollingFrame")
-logScroll.BackgroundTransparency = 1
-logScroll.BorderSizePixel = 0
-logScroll.Position = UDim2.fromOffset(6, 24)
-logScroll.Size = UDim2.new(1, -12, 1, -28)
-logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-logScroll.ScrollBarThickness = 5
-logScroll.ScrollBarImageColor3 = THEME.Accent
-logScroll.Parent = logFrame
-
-logLabel = Instance.new("TextLabel")
-logLabel.BackgroundTransparency = 1
-logLabel.BorderSizePixel = 0
-logLabel.Text = ""
-logLabel.TextColor3 = THEME.Text
-logLabel.TextSize = 11
-logLabel.Font = Enum.Font.Code
-logLabel.TextXAlignment = Enum.TextXAlignment.Left
-logLabel.TextYAlignment = Enum.TextYAlignment.Top
-logLabel.TextWrapped = true
-logLabel.Size = UDim2.new(1, -8, 0, 16)
-logLabel.Position = UDim2.fromOffset(0, 0)
-logLabel.Parent = logScroll
+local ui = uiOrErr
+local screenGui = ui.screenGui
+local main = ui.main
+local content = ui.content
+local header = ui.header
+local headerH = ui.headerH
+local featureScroll = ui.featureScroll
+local startAllBtn = ui.startAllBtn
+local stopAllBtn = ui.stopAllBtn
+local loggingBtn = ui.loggingBtn
+local clearBtn = ui.clearBtn
+local copyBtn = ui.copyBtn
+local buyGachaBtn = ui.buyGachaBtn
+local minBtn = ui.minBtn
+local closeBtn = ui.closeBtn
 
 local features = {}
 local featureOrder = {}
@@ -362,21 +451,20 @@ end
 local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, extraCallback)
     local row = Instance.new("Frame")
     row.Name = id
-    row.Size = UDim2.new(1, -4, 0, 60)
+    row.Size = UDim2.new(1, -8, 0, 60)
     row.BackgroundColor3 = THEME.Panel
-    row.BorderSizePixel = 0
+    row.BorderSizePixel = 1
+    row.BorderColor3 = THEME.Border
     row.Parent = featureScroll
-    corner(row, 8)
-    stroke(row, THEME.Border, 1)
+    applyCorner(row, 8)
 
-    local titleLabel = makeLabel(row, name, UDim2.new(1, -150, 0, 18), UDim2.fromOffset(10, 5), 13, THEME.Text)
-    titleLabel.Font = Enum.Font.GothamBold
+    local titleLabel = makeLabel(row, name, UDim2.new(1, -150, 0, 18), UDim2.fromOffset(10, 5), 13, THEME.Text, true)
     titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local descLabel = makeLabel(row, desc, UDim2.new(1, -150, 0, 16), UDim2.fromOffset(10, 23), 10, THEME.Muted)
+    local descLabel = makeLabel(row, desc, UDim2.new(1, -150, 0, 16), UDim2.fromOffset(10, 23), 10, THEME.Muted, false)
     descLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local statusLabel = makeLabel(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted)
+    local statusLabel = makeLabel(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted, false)
     statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
     local btn = makeButton(row, "Start", UDim2.fromOffset(64, 28), UDim2.new(1, -74, 0, 5))
@@ -412,6 +500,7 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
         setFeatureRunning(id, not f.running)
     end)
 
+    featureScroll.CanvasSize = UDim2.new(0, 0, 0, #featureOrder * 66 + 8)
     return f
 end
 

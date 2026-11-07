@@ -1,11 +1,14 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — v5 (Gameplay + Performance Update)
+-- ELITES HALLOWEEN FARM — v6 (Flying + Noclip + Better Detection + Speed Slider)
 -- Delta Executor / Android / live Blox Fruits
--- Preserves v4 GUI. Adds Auto Pumpkin Farm, Auto Trick or Treat,
--- and replaces the Event Keyword Observer with an event-driven, lag-free design.
--- Does NOT invent remotes, rewards, or guaranteed server authority.
+-- Preserves v5 GUI + features. Changes:
+--   * Pumpkin farm now FLIES via CFrame interpolation at configurable studs/s
+--   * Auto-noclip tied to farm lifecycle (enable on start, disable on stop)
+--   * Detection: immediately retarget on pumpkin loss; only WAIT if no pumpkins map-wide
+--   * New "Tween Speed" slider in toolbar (50-250, default 200)
+--   * Single RenderStepped connection drives both fly + noclip (no duplicates)
 
-print("[EHF] v5 starting...")
+print("[EHF] v6 starting...")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21,9 +24,6 @@ if not player then
     return
 end
 
--- =========================================================
--- PURGE STALE GUIS
--- =========================================================
 local function purgeAll()
     local parents = {}
     local okPg, pg = pcall(function() return player:FindFirstChild("PlayerGui") end)
@@ -42,9 +42,6 @@ local function purgeAll()
 end
 purgeAll()
 
--- =========================================================
--- GUI PARENT
--- =========================================================
 local function resolveGuiParent()
     local okPg, pg = pcall(function()
         return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5)
@@ -72,23 +69,20 @@ if not guiParent then
     return
 end
 
--- =========================================================
--- CONFIG
--- =========================================================
 local CONFIG = {
     GACHA_BOX = "Halloween26Gacha",
-    PUMPKIN_RESPAWN = 690, -- observed, not server-confirmed
+    PUMPKIN_RESPAWN = 690,
     MAX_LOG_LINES = 200,
     FEATURE_TICK = 1,
-    EVENT_SCAN_INTERVAL = 10, -- seconds between passive scans (was 1s full scan)
-    MOVE_RETRY_TIME = 3, -- seconds before re-issuing MoveTo
-    ATTACK_COOLDOWN = 0.35, -- matches captured RegisterAttack timing
-    TOUCH_DISTANCE = 8, -- studs: close enough to attack
+    EVENT_SCAN_INTERVAL = 10,
+    ATTACK_COOLDOWN = 0.35,
+    TOUCH_DISTANCE = 8,
+    FLY_SPEED_DEFAULT = 200,
+    FLY_SPEED_MIN = 50,
+    FLY_SPEED_MAX = 250,
+    WAITING_RESCAN = 5,
 }
 
--- =========================================================
--- THEME
--- =========================================================
 local THEME = {
     Background = Color3.fromRGB(18, 10, 26),
     Panel = Color3.fromRGB(32, 20, 48),
@@ -112,9 +106,6 @@ do
     end
 end
 
--- =========================================================
--- LOGGING
--- =========================================================
 local function timestamp()
     local ok, res = pcall(function() return os.date("%H:%M:%S") end)
     if ok and res then return res end
@@ -155,9 +146,6 @@ local function addLog(tag, msg)
     if updateSummary then updateSummary() end
 end
 
--- =========================================================
--- UI HELPERS
--- =========================================================
 local function applyCorner(frame, radius)
     pcall(function()
         local c = Instance.new("UICorner")
@@ -218,7 +206,26 @@ local function makeButton(parent, text, size, pos)
 end
 
 -- =========================================================
--- BUILD UI (preserved from v4)
+-- PUMPKIN FARM STATE (declared before UI so slider can touch it)
+-- =========================================================
+local pumpkinFarm = {
+    running = false,
+    thread = nil,
+    state = "IDLE",
+    currentPumpkin = nil,
+    currentRoot = nil,
+    flyTarget = nil,
+    speed = CONFIG.FLY_SPEED_DEFAULT,
+    lastAttackTime = 0,
+    lastRespawnAt = nil,
+    lastWaitScanTime = 0,
+    lastHumanoid = nil,
+}
+
+local noclipParts = {}
+
+-- =========================================================
+-- BUILD UI
 -- =========================================================
 local screenGui
 local main
@@ -227,6 +234,7 @@ local headerH = 44
 local featureScroll
 local startAllBtn, stopAllBtn, loggingBtn, clearBtn, copyBtn, buyGachaBtn
 local minBtn, closeBtn
+local speedLabel, speedFill, speedThumb
 
 local function buildUI()
     local viewport
@@ -290,7 +298,7 @@ local function buildUI()
 
     local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
     title.ZIndex = 4
-    local subtitle = makeLabel(header, "Client observer + best-effort farm — no fake rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+    local subtitle = makeLabel(header, "Fly-farm + best-effort attack — no fake rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
     subtitle.ZIndex = 4
 
     minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
@@ -305,15 +313,19 @@ local function buildUI()
     local contentBottom = mainH - 6
     local contentHeight = contentBottom - contentTop
 
-    local toolbar = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, 66), UDim2.fromOffset(contentLeft, contentTop), "Toolbar")
+    local toolbarH = 96
+    local toolbar = makeFrame(main, THEME.Panel, UDim2.fromOffset(contentWidth, toolbarH), UDim2.fromOffset(contentLeft, contentTop), "Toolbar")
     toolbar.ZIndex = 3
 
+    -- Row 1
     startAllBtn = makeButton(toolbar, "Start All", UDim2.fromOffset(84, 28), UDim2.fromOffset(4, 4))
     startAllBtn.ZIndex = 5
     stopAllBtn = makeButton(toolbar, "Stop All", UDim2.fromOffset(84, 28), UDim2.fromOffset(92, 4))
     stopAllBtn.ZIndex = 5
     loggingBtn = makeButton(toolbar, "Logging: ON", UDim2.fromOffset(108, 28), UDim2.fromOffset(180, 4))
     loggingBtn.ZIndex = 5
+
+    -- Row 2
     clearBtn = makeButton(toolbar, "Clear Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(4, 36))
     clearBtn.ZIndex = 5
     copyBtn = makeButton(toolbar, "Copy Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(92, 36))
@@ -322,10 +334,101 @@ local function buildUI()
     buyGachaBtn.BackgroundColor3 = Color3.fromRGB(80, 46, 70)
     buyGachaBtn.ZIndex = 5
 
-    local featureY = contentTop + 72
+    -- Row 3: Tween Speed slider
+    local speedRow = Instance.new("Frame")
+    speedRow.Name = "SpeedRow"
+    speedRow.BackgroundTransparency = 1
+    speedRow.Position = UDim2.fromOffset(4, 66)
+    speedRow.Size = UDim2.new(1, -8, 0, 28)
+    speedRow.ZIndex = 4
+    speedRow.Parent = toolbar
+
+    speedLabel = makeLabel(speedRow, "Tween Speed: " .. CONFIG.FLY_SPEED_DEFAULT, UDim2.fromOffset(140, 28), UDim2.fromOffset(0, 0), 11, THEME.Text, true)
+    speedLabel.TextYAlignment = Enum.TextYAlignment.Center
+    speedLabel.ZIndex = 5
+
+    local speedHit = Instance.new("Frame")
+    speedHit.Name = "SpeedHit"
+    speedHit.BackgroundTransparency = 1
+    speedHit.Position = UDim2.fromOffset(146, -4)
+    speedHit.Size = UDim2.new(1, -152, 0, 36)
+    speedHit.ZIndex = 5
+    speedHit.Parent = speedRow
+
+    local speedTrack = Instance.new("Frame")
+    speedTrack.Name = "SpeedTrack"
+    speedTrack.BackgroundColor3 = THEME.Button
+    speedTrack.BorderSizePixel = 1
+    speedTrack.BorderColor3 = THEME.Border
+    speedTrack.AnchorPoint = Vector2.new(0, 0.5)
+    speedTrack.Position = UDim2.new(0, 0, 0.5, 0)
+    speedTrack.Size = UDim2.new(1, 0, 0, 14)
+    speedTrack.ZIndex = 6
+    speedTrack.Parent = speedHit
+    applyCorner(speedTrack, 7)
+
+    speedFill = Instance.new("Frame")
+    speedFill.BackgroundColor3 = THEME.Accent
+    speedFill.BorderSizePixel = 0
+    speedFill.Position = UDim2.fromOffset(0, 0)
+    speedFill.Size = UDim2.new(0.5, 0, 1, 0)
+    speedFill.ZIndex = 7
+    speedFill.Parent = speedTrack
+    applyCorner(speedFill, 7)
+
+    speedThumb = Instance.new("Frame")
+    speedThumb.BackgroundColor3 = THEME.Text
+    speedThumb.BorderSizePixel = 0
+    speedThumb.Size = UDim2.fromOffset(22, 22)
+    speedThumb.AnchorPoint = Vector2.new(0.5, 0.5)
+    speedThumb.Position = UDim2.new(0.5, 0, 0.5, 0)
+    speedThumb.ZIndex = 8
+    speedThumb.Parent = speedTrack
+    applyCorner(speedThumb, 11)
+
+    local function setSpeedFromX(x)
+        local trackAbs = speedHit.AbsolutePosition
+        local trackSize = speedHit.AbsoluteSize
+        if trackSize.X <= 0 then return end
+        local rel = math.clamp((x - trackAbs.X) / trackSize.X, 0, 1)
+        local value = math.floor(CONFIG.FLY_SPEED_MIN + rel * (CONFIG.FLY_SPEED_MAX - CONFIG.FLY_SPEED_MIN) + 0.5)
+        pumpkinFarm.speed = value
+        speedFill.Size = UDim2.new(rel, 0, 1, 0)
+        speedThumb.Position = UDim2.new(rel, 0, 0.5, 0)
+        speedLabel.Text = "Tween Speed: " .. value
+    end
+
+    local speedDragging = false
+    speedHit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            speedDragging = true
+            setSpeedFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not speedDragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            setSpeedFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            speedDragging = false
+        end
+    end)
+
+    -- Initialize to default
+    do
+        local rel = (CONFIG.FLY_SPEED_DEFAULT - CONFIG.FLY_SPEED_MIN) / (CONFIG.FLY_SPEED_MAX - CONFIG.FLY_SPEED_MIN)
+        speedFill.Size = UDim2.new(rel, 0, 1, 0)
+        speedThumb.Position = UDim2.new(rel, 0, 0.5, 0)
+        speedLabel.Text = "Tween Speed: " .. CONFIG.FLY_SPEED_DEFAULT
+    end
+
+    local featureY = contentTop + toolbarH + 6
     local summaryH = 50
     local logMinH = 80
-    local featureH = contentHeight - 72 - summaryH - logMinH - 12
+    local featureH = contentHeight - toolbarH - 6 - summaryH - logMinH - 12
     if featureH < 100 then featureH = 100 end
     local summaryY = featureY + featureH + 6
     local logY = summaryY + summaryH + 6
@@ -400,13 +503,6 @@ local function buildUI()
             warn("[EHF] Loading banner removed.")
         end
     end)
-
-    task.delay(0.5, function()
-        local ok, abs = pcall(function() return main.AbsoluteSize end)
-        if ok and abs then
-            warn(string.format("[EHF] main.AbsoluteSize = %dx%d", abs.X, abs.Y))
-        end
-    end)
 end
 
 local okBuild, errBuild = pcall(buildUI)
@@ -432,7 +528,7 @@ updateSummary = function()
         if f and f.running then running = running + 1 end
     end
     if summaryStatus then
-        summaryStatus.Text = string.format("%d feature(s) running. Log lines: %d. Client-side only.", running, #logLines)
+        summaryStatus.Text = string.format("%d feature(s) running. Log lines: %d. Speed: %d studs/s.", running, #logLines, pumpkinFarm.speed)
     end
 end
 
@@ -555,38 +651,23 @@ local function getRegisterHit()
 end
 
 -- =========================================================
--- AUTO PUMPKIN FARM (PRIORITY 1)
+-- PUMPKIN DETECTION (map-wide via PumpkinHunt)
 -- =========================================================
-local pumpkinFarm = {
-    running = false,
-    thread = nil,
-    state = "IDLE", -- IDLE / MOVING / ATTACKING / WAITING
-    currentPumpkin = nil,
-    currentRoot = nil,
-    lastMoveTime = 0,
-    lastAttackTime = 0,
-    lastRespawnAt = nil,
-}
-
 local function findClosestPumpkin()
     local hunt = Workspace:FindFirstChild("PumpkinHunt")
     if not hunt then return nil, nil end
-
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil, nil end
 
-    local best, bestDist = nil, math.huge
-    local bestRoot = nil
-
-    -- Only iterate direct children and named descendants, not full GetDescendants on huge workspace
+    local best, bestDist, bestRoot = nil, math.huge, nil
     local ok, descendants = pcall(function() return hunt:GetDescendants() end)
     if not ok then return nil, nil end
 
     for _, d in ipairs(descendants) do
-        if d:IsA("Model") and d.Name:lower():find("pumpkin", 1, true) then
+        if d:IsA("Model") and d.Parent and d.Name:lower():find("pumpkin", 1, true) then
             local root = d:FindFirstChild("RootPart") or d:FindFirstChild("HumanoidRootPart")
-            if root and root:IsA("BasePart") then
+            if root and root:IsA("BasePart") and root.Parent then
                 local dist = (root.Position - hrp.Position).Magnitude
                 if dist < bestDist then
                     best, bestDist, bestRoot = d, dist, root
@@ -619,19 +700,162 @@ end
 local function fireRegisterAttack()
     local remote = getRegisterAttack()
     if not remote then return false end
-    local ok = pcall(function()
-        remote:FireServer(0.4000000059604645, 1)
-    end)
-    return ok
+    return (pcall(function() remote:FireServer(0.4000000059604645, 1) end))
 end
 
 local function fireRegisterHit(rootPart)
     local remote = getRegisterHit()
     if not remote or not rootPart then return false end
-    local ok = pcall(function()
-        remote:FireServer(rootPart)
+    return (pcall(function() remote:FireServer(rootPart) end))
+end
+
+-- =========================================================
+-- SINGLE RENDER LOOP: fly movement + auto noclip
+-- =========================================================
+RunService.RenderStepped:Connect(function(dt)
+    if not pumpkinFarm.running then return end
+
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    -- Character changed (respawn): reset tracked parts, re-apply PlatformStand
+    if hum ~= pumpkinFarm.lastHumanoid then
+        pumpkinFarm.lastHumanoid = hum
+        noclipParts = {}
+        pcall(function() hum.PlatformStand = true end)
+    end
+
+    -- Auto noclip: track only parts we disabled
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            part.CanCollide = false
+            noclipParts[part] = true
+        end
+    end
+
+    -- Fly movement
+    if pumpkinFarm.flyTarget then
+        local offset = pumpkinFarm.flyTarget - hrp.Position
+        local dist = offset.Magnitude
+        if dist < 0.5 then
+            pumpkinFarm.flyTarget = nil
+        else
+            local step = math.min(dist, pumpkinFarm.speed * dt)
+            hrp.CFrame = hrp.CFrame + offset.Unit * step
+        end
+    end
+end)
+
+-- =========================================================
+-- PUMPKIN FARM TICK (state machine, no movement here)
+-- =========================================================
+local function pumpkinFarmTick()
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        setFeatureStatus("pumpkin", "no character")
+        return
+    end
+
+    -- Validate target
+    if pumpkinFarm.currentPumpkin then
+        local p = pumpkinFarm.currentPumpkin
+        local r = pumpkinFarm.currentRoot
+        if not p.Parent or not r or not r.Parent then
+            addLog("PUMPKIN", "Target gone: " .. tostring(p.Name))
+            pumpkinFarm.currentPumpkin = nil
+            pumpkinFarm.currentRoot = nil
+            pumpkinFarm.flyTarget = nil
+        end
+    end
+
+    -- If no target, try to find one (respecting WAITING backoff)
+    if not pumpkinFarm.currentPumpkin then
+        if pumpkinFarm.state == "WAITING" and pumpkinFarm.lastRespawnAt then
+            local remain = CONFIG.PUMPKIN_RESPAWN - (os.clock() - pumpkinFarm.lastRespawnAt)
+            local sinceCheck = os.clock() - pumpkinFarm.lastWaitScanTime
+            if remain > 0 and sinceCheck < CONFIG.WAITING_RESCAN then
+                setFeatureStatus("pumpkin", string.format("respawn est. %02d:%02d", math.floor(remain/60), math.floor(remain%60)))
+                return
+            end
+            pumpkinFarm.lastWaitScanTime = os.clock()
+        end
+
+        local p, r = findClosestPumpkin()
+        if p and r then
+            pumpkinFarm.currentPumpkin = p
+            pumpkinFarm.currentRoot = r
+            pumpkinFarm.state = "MOVING"
+            pumpkinFarm.flyTarget = r.Position
+            pumpkinFarm.lastRespawnAt = nil
+            addLog("PUMPKIN", "Targeting " .. p.Name)
+        else
+            if pumpkinFarm.state ~= "WAITING" then
+                pumpkinFarm.state = "WAITING"
+                pumpkinFarm.lastRespawnAt = os.clock()
+                pumpkinFarm.lastWaitScanTime = os.clock()
+                addLog("PUMPKIN", "No pumpkins available. Waiting for respawn.")
+            end
+            pumpkinFarm.flyTarget = nil
+            setFeatureStatus("pumpkin", "no pumpkins")
+            return
+        end
+    end
+
+    -- Act on target
+    local root = pumpkinFarm.currentRoot
+    local pumpkin = pumpkinFarm.currentPumpkin
+    if not root or not pumpkin then return end
+
+    local dist = (root.Position - hrp.Position).Magnitude
+    if dist > CONFIG.TOUCH_DISTANCE then
+        pumpkinFarm.flyTarget = root.Position
+        pumpkinFarm.state = "MOVING"
+        setFeatureStatus("pumpkin", string.format("flying (%.0f studs @ %d/s)", dist, pumpkinFarm.speed))
+    else
+        pumpkinFarm.flyTarget = nil
+        pumpkinFarm.state = "ATTACKING"
+        setFeatureStatus("pumpkin", "attacking " .. pumpkin.Name .. " (" .. getEquippedFightingStyle() .. ")")
+
+        pcall(function()
+            hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(root.Position.X, hrp.Position.Y, root.Position.Z))
+        end)
+
+        if os.clock() - pumpkinFarm.lastAttackTime >= CONFIG.ATTACK_COOLDOWN then
+            pumpkinFarm.lastAttackTime = os.clock()
+            local aOk = fireRegisterAttack()
+            local hOk = fireRegisterHit(root)
+            if not aOk and not hOk then
+                addLog("PUMPKIN", "Attack remotes unavailable — cannot damage.")
+                setFeatureStatus("pumpkin", "attack remotes missing")
+            end
+        end
+    end
+end
+
+local function pumpkinFarmStart()
+    if pumpkinFarm.running then return end
+    pumpkinFarm.running = true
+    pumpkinFarm.state = "IDLE"
+    pumpkinFarm.currentPumpkin = nil
+    pumpkinFarm.currentRoot = nil
+    pumpkinFarm.flyTarget = nil
+    pumpkinFarm.lastRespawnAt = nil
+    pumpkinFarm.lastWaitScanTime = 0
+    pumpkinFarm.lastAttackTime = 0
+    pumpkinFarm.lastHumanoid = nil
+    noclipParts = {}
+
+    addLog("PUMPKIN", "Auto Pumpkin Farm started. Flying @ " .. pumpkinFarm.speed .. " studs/s. Auto-noclip ON.")
+    pumpkinFarm.thread = task.spawn(function()
+        while pumpkinFarm.running do
+            pcall(pumpkinFarmTick)
+            task.wait(0.1)
+        end
     end)
-    return ok
 end
 
 local function stopPumpkinFarm()
@@ -640,125 +864,47 @@ local function stopPumpkinFarm()
         pcall(function() task.cancel(pumpkinFarm.thread) end)
         pumpkinFarm.thread = nil
     end
-    pumpkinFarm.state = "IDLE"
+    pumpkinFarm.flyTarget = nil
     pumpkinFarm.currentPumpkin = nil
     pumpkinFarm.currentRoot = nil
-    addLog("PUMPKIN", "Auto Pumpkin Farm stopped.")
-end
-
-local function pumpkinFarmStart()
-    if pumpkinFarm.running then return end
-    pumpkinFarm.running = true
     pumpkinFarm.state = "IDLE"
-    addLog("PUMPKIN", "Auto Pumpkin Farm started. Best-effort: navigation + captured attack remotes.")
-    pumpkinFarm.thread = task.spawn(function()
-        while pumpkinFarm.running do
-            local char = player.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
+    pumpkinFarm.lastRespawnAt = nil
 
-            if not hrp or not hum then
-                setFeatureStatus("pumpkin", "no character")
-                task.wait(1)
-            else
-                if pumpkinFarm.state == "WAITING" then
-                    local remain = CONFIG.PUMPKIN_RESPAWN - (os.clock() - (pumpkinFarm.lastRespawnAt or 0))
-                    if remain > 0 then
-                        setFeatureStatus("pumpkin", string.format("respawn in %02d:%02d", math.floor(remain/60), math.floor(remain%60)))
-                    else
-                        pumpkinFarm.state = "IDLE"
-                        pumpkinFarm.lastRespawnAt = nil
-                    end
-                elseif pumpkinFarm.state == "IDLE" or pumpkinFarm.state == "MOVING" then
-                    local pumpkin, root = findClosestPumpkin()
-                    if not pumpkin or not root then
-                        setFeatureStatus("pumpkin", "no pumpkin found — waiting")
-                        task.wait(2)
-                    else
-                        pumpkinFarm.currentPumpkin = pumpkin
-                        pumpkinFarm.currentRoot = root
-                        local dist = (root.Position - hrp.Position).Magnitude
-                        if dist <= CONFIG.TOUCH_DISTANCE then
-                            pumpkinFarm.state = "ATTACKING"
-                            setFeatureStatus("pumpkin", "attacking " .. pumpkin.Name)
-                        else
-                            pumpkinFarm.state = "MOVING"
-                            setFeatureStatus("pumpkin", string.format("moving (%.0f studs)", dist))
-                            -- Re-issue MoveTo every few seconds
-                            if os.clock() - pumpkinFarm.lastMoveTime > CONFIG.MOVE_RETRY_TIME then
-                                pumpkinFarm.lastMoveTime = os.clock()
-                                local ok = pcall(function()
-                                    hum:MoveTo(root.Position)
-                                end)
-                                if not ok then
-                                    addLog("PUMPKIN", "MoveTo failed.")
-                                end
-                            end
-                        end
-                    end
-                elseif pumpkinFarm.state == "ATTACKING" then
-                    local root = pumpkinFarm.currentRoot
-                    local pumpkin = pumpkinFarm.currentPumpkin
-                    if not root or not pumpkin or not pumpkin.Parent then
-                        -- Pumpkin disappeared — start respawn timer
-                        addLog("PUMPKIN", "Pumpkin disappeared. Starting 690s respawn estimate.")
-                        pumpkinFarm.state = "WAITING"
-                        pumpkinFarm.lastRespawnAt = os.clock()
-                        pumpkinFarm.currentPumpkin = nil
-                        pumpkinFarm.currentRoot = nil
-                        setFeatureStatus("pumpkin", "respawn timer started")
-                    else
-                        -- Face pumpkin and attack
-                        local dist = (root.Position - hrp.Position).Magnitude
-                        if dist > CONFIG.TOUCH_DISTANCE * 1.5 then
-                            pumpkinFarm.state = "MOVING"
-                        else
-                            local style = getEquippedFightingStyle()
-                            setFeatureStatus("pumpkin", "attacking (" .. style .. ")")
-                            if os.clock() - pumpkinFarm.lastAttackTime >= CONFIG.ATTACK_COOLDOWN then
-                                pumpkinFarm.lastAttackTime = os.clock()
-                                -- 1. Orient character
-                                pcall(function()
-                                    hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(root.Position.X, hrp.Position.Y, root.Position.Z))
-                                end)
-                                -- 2. Fire captured attack registration
-                                local attackOk = fireRegisterAttack()
-                                -- 3. Fire captured hit registration
-                                local hitOk = fireRegisterHit(root)
-                                if not attackOk and not hitOk then
-                                    -- Both remotes missing or failed; do not spam
-                                    addLog("PUMPKIN", "Attack remotes unavailable. Cannot auto-damage.")
-                                    setFeatureStatus("pumpkin", "attack remotes missing")
-                                end
-                            end
-                        end
-                    end
-                end
+    for part in pairs(noclipParts) do
+        pcall(function()
+            if part.Parent and part:IsA("BasePart") then
+                part.CanCollide = true
             end
-            task.wait(0.1)
-        end
-    end)
+        end)
+    end
+    noclipParts = {}
+
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum.PlatformStand = false end)
+    end
+    pumpkinFarm.lastHumanoid = nil
+
+    addLog("PUMPKIN", "Auto Pumpkin Farm stopped. Noclip OFF.")
 end
 
 -- =========================================================
--- AUTO TRICK OR TREAT (PRIORITY 2)
+-- AUTO TRICK OR TREAT
 -- =========================================================
 local trickOrTreat = {
     running = false,
     thread = nil,
-    lastInteraction = 0,
-    delay = 1.5, -- seconds between interactions
+    delay = 1.5,
 }
 
 local function findTrickOrTreatDoors()
     local doors = {}
-    -- Look in common event folders and workspace children
     local candidateRoots = {}
     for _, name in ipairs({ "Halloween", "NPCs", "PumpkinHunt" }) do
         local r = Workspace:FindFirstChild(name)
         if r then table.insert(candidateRoots, r) end
     end
-    -- Also check direct workspace children for "Door" / "Trick" models
     for _, child in ipairs(Workspace:GetChildren()) do
         if child:IsA("Model") and (child.Name:lower():find("door", 1, true) or child.Name:lower():find("trick", 1, true)) then
             table.insert(doors, child)
@@ -789,7 +935,7 @@ end
 local function trickOrTreatStart()
     if trickOrTreat.running then return end
     trickOrTreat.running = true
-    addLog("TREAT", "Auto Trick or Treat started. Best-effort: detects doors, attempts interaction. Event may not be active.")
+    addLog("TREAT", "Auto Trick or Treat started. Best-effort.")
     trickOrTreat.thread = task.spawn(function()
         while trickOrTreat.running do
             local char = player.Character
@@ -802,7 +948,6 @@ local function trickOrTreatStart()
                 if #doors == 0 then
                     setFeatureStatus("treat", "no doors found")
                 else
-                    -- Move to closest door if not already there
                     local best, bestDist = nil, math.huge
                     for _, door in ipairs(doors) do
                         local root = door:FindFirstChild("RootPart") or door:FindFirstChild("HumanoidRootPart") or door.PrimaryPart
@@ -812,27 +957,23 @@ local function trickOrTreatStart()
                         end
                     end
                     if best and bestDist <= 10 then
-                        -- Try to interact via ProximityPrompt
                         local prompt = best:FindFirstChildWhichIsA("ProximityPrompt", true)
                         if prompt then
                             pcall(function() prompt:InputHoldBegin() end)
                             task.wait(0.1)
                             pcall(function() prompt:InputHoldEnd() end)
-                            addLog("TREAT", "Attempted ProximityPrompt on " .. best.Name)
+                            addLog("TREAT", "ProximityPrompt on " .. best.Name)
                         else
-                            -- Try OnTalkToNPC remote if door has an NPC child
                             local remote = findRemotePath(ReplicatedStorage, { "Remotes", "OnTalkToNPC" })
                             if remote then
-                                local npc = best:FindFirstChildWhichIsA("Model") or best
-                                pcall(function() remote:FireServer(npc) end)
-                                addLog("TREAT", "Attempted OnTalkToNPC on " .. best.Name)
+                                pcall(function() remote:FireServer(best) end)
+                                addLog("TREAT", "OnTalkToNPC on " .. best.Name)
                             else
-                                addLog("TREAT", "No interaction method found for " .. best.Name)
+                                addLog("TREAT", "No interaction method for " .. best.Name)
                             end
                         end
                         task.wait(trickOrTreat.delay)
                     elseif best then
-                        -- Move toward door
                         local hum = char and char:FindFirstChildOfClass("Humanoid")
                         if hum then
                             pcall(function()
@@ -850,14 +991,13 @@ local function trickOrTreatStart()
 end
 
 -- =========================================================
--- EVENT KEYWORD OBSERVER (OPTIMIZED — PRIORITY 3)
+-- EVENT KEYWORD OBSERVER (event-driven, no full workspace scan)
 -- =========================================================
 local eventObserver = {
     running = false,
     thread = nil,
     connections = {},
     knownObjects = {},
-    lastScan = 0,
 }
 
 local EVENT_KEYWORDS = { "trick", "treat", "dapper", "cursed", "seed", "spooky", "jack", "pumpkin", "halloween" }
@@ -872,11 +1012,9 @@ end
 
 local function handleAdded(inst)
     if not eventObserver.running then return end
-    if isEventObject(inst) then
-        if not eventObserver.knownObjects[inst] then
-            eventObserver.knownObjects[inst] = true
-            addLog("EVENT", "Added: " .. inst.ClassName .. ":" .. inst.Name)
-        end
+    if isEventObject(inst) and not eventObserver.knownObjects[inst] then
+        eventObserver.knownObjects[inst] = true
+        addLog("EVENT", "Added: " .. inst.ClassName .. ":" .. inst.Name)
     end
 end
 
@@ -906,49 +1044,44 @@ local function eventObserverStart()
     eventObserver.running = true
     eventObserver.knownObjects = {}
     eventObserver.connections = {}
-    addLog("EVENT", "Event Keyword Observer started (event-driven, no full workspace scan).")
+    addLog("EVENT", "Event Keyword Observer started (event-driven).")
 
-    -- Connect to specific containers only
     local containers = {}
     for _, name in ipairs({ "PumpkinHunt", "NPCs", "Halloween" }) do
         local c = Workspace:FindFirstChild(name)
         if c then table.insert(containers, c) end
     end
     if #containers == 0 then
-        addLog("EVENT", "No known event containers found. Observer will not scan entire workspace.")
+        addLog("EVENT", "No known event containers found.")
         setFeatureStatus("events", "no containers")
     else
         for _, c in ipairs(containers) do
             table.insert(eventObserver.connections, c.DescendantAdded:Connect(handleAdded))
             table.insert(eventObserver.connections, c.DescendantRemoved:Connect(handleRemoved))
         end
-        -- Initial one-time scan of just these containers
         for _, c in ipairs(containers) do
             local ok, descendants = pcall(function() return c:GetDescendants() end)
             if ok then
                 for _, d in ipairs(descendants) do
-                    if isEventObject(d) and not eventObserver.knownObjects[d] then
-                        eventObserver.knownObjects[d] = true
-                    end
+                    if isEventObject(d) then eventObserver.knownObjects[d] = true end
                 end
             end
         end
         addLog("EVENT", "Connected to " .. #containers .. " container(s).")
     end
 
-    -- Optional low-frequency status ticker (not a full scan)
     eventObserver.thread = task.spawn(function()
         while eventObserver.running do
             task.wait(CONFIG.EVENT_SCAN_INTERVAL)
             local count = 0
             for _ in pairs(eventObserver.knownObjects) do count = count + 1 end
-            setFeatureStatus("events", tostring(count) .. " event object(s) tracked")
+            setFeatureStatus("events", tostring(count) .. " tracked")
         end
     end)
 end
 
 -- =========================================================
--- MATERIAL SCANNER (preserved)
+-- MATERIAL SCANNER
 -- =========================================================
 local MATERIAL_KEYWORDS = { "candy", "corn", "pumpkin", "bit", "seed", "treat", "halloween", "spooky", "soul", "bone" }
 
@@ -1000,7 +1133,7 @@ local function materialTick()
     local snap = collectMaterials()
     local str = materialString(snap)
     if not materialSnapshot then
-        addLog("MATERIAL", "Initial readable materials: " .. (str ~= "" and str or "none"))
+        addLog("MATERIAL", "Initial materials: " .. (str ~= "" and str or "none"))
         materialSnapshot = snap
     elseif materialString(materialSnapshot) ~= str then
         addLog("MATERIAL", "Material changes: " .. (str ~= "" and str or "none"))
@@ -1012,7 +1145,7 @@ local function materialTick()
 end
 
 -- =========================================================
--- GACHA MONITOR (preserved)
+-- GACHA MONITOR
 -- =========================================================
 local gachaLastPresent = nil
 
@@ -1071,7 +1204,7 @@ local function requestGachaPurchase()
 end
 
 -- =========================================================
--- FRUIT OBSERVER (preserved)
+-- FRUIT OBSERVER
 -- =========================================================
 local fruitLastString = nil
 local function collectFruits()
@@ -1098,12 +1231,12 @@ local function fruitTick()
 end
 
 -- =========================================================
--- RESPAWN COUNTDOWN (preserved)
+-- RESPAWN COUNTDOWN
 -- =========================================================
 local respawnEndsAt = nil
 local respawnNotified = true
 local function respawnStart()
-    addLog("RESPAWN", "Respawn countdown started (observed 690s estimate).")
+    addLog("RESPAWN", "Respawn countdown started.")
 end
 local function respawnTick()
     if respawnEndsAt then
@@ -1122,11 +1255,9 @@ local function respawnTick()
         setFeatureStatus("respawn", "waiting for pumpkin removal")
     end
 end
--- Hook pumpkin disappearance to respawn timer
-local originalPumpkinTick -- not used; pumpkinFarm sets it directly
 
 -- =========================================================
--- DIAGNOSTICS (preserved)
+-- DIAGNOSTICS
 -- =========================================================
 local DIAG_PATHS = {
     { "Remotes", "OnTalkToNPC" },
@@ -1159,9 +1290,9 @@ local function diagTick()
 end
 
 -- =========================================================
--- REGISTER FEATURES (order preserved, new ones added)
+-- REGISTER FEATURES
 -- =========================================================
-addFeature("pumpkin", "Auto Pumpkin Farm", "Navigate + best-effort attack using captured remotes.", pumpkinFarmStart, stopPumpkinFarm, nil)
+addFeature("pumpkin", "Auto Pumpkin Farm", "Fly to pumpkins, auto-noclip, best-effort attack.", pumpkinFarmStart, stopPumpkinFarm, nil)
 addFeature("treat", "Auto Trick or Treat", "Detects doors, attempts ProximityPrompt / OnTalkToNPC.", trickOrTreatStart, stopTrickOrTreat, nil)
 addFeature("events", "Event Keyword Observer", "Event-driven. No full workspace scan.", eventObserverStart, stopEventObserver, nil)
 addFeature("materials", "Material Scanner", "Reads local attributes, leaderstats, tools.", materialStart, nil, materialTick)
@@ -1270,7 +1401,7 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
-addLog("SYS", "ELITES HALLOWEEN FARM v5 loaded. Auto Pumpkin Farm is best-effort (server may reject remotes).")
-addLog("SYS", "Event Observer is now event-driven. No 25s lag spike.")
+addLog("SYS", "ELITES HALLOWEEN FARM v6 loaded. Flying farm + auto-noclip + speed slider.")
+addLog("SYS", "Server still validates attack remotes; farming is best-effort.")
 updateSummary()
-warn("[EHF] v5 GUI loaded successfully.")
+warn("[EHF] v6 GUI loaded successfully.")

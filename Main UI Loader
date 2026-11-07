@@ -1,10 +1,12 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — v11
--- Adds: 1h gacha window tracker, single-word fruit detection,
---       Defensive Evade (off by default), Fruit Guard (on by default)
--- Preserves: smooth fly, nearest target, stats, ToT, all v10 features.
+-- ELITES HALLOWEEN FARM — v12
+-- Fixes: pumpkin farm no longer paused by pre-existing fruits.
+--        gacha rolls count any new fruit (no 60s window needed).
+--        gacha timer reads real game "wait xx:xx" message.
+--        Auto Buy Gacha toggle (green/red).
+--        All toggle buttons green-on / red-off.
 
-print("[EHF] v11 starting...")
+print("[EHF] v12 starting...")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -27,18 +29,18 @@ local function purgeAll()
     if okHui and hui then table.insert(parents, hui) end
     for _, p in ipairs(parents) do
         local old = p:FindFirstChild("ElitesHalloweenFarm")
-        if old then old:Destroy(); warn("[EHF] Purged stale GUI.") end
+        if old then old:Destroy() end
     end
 end
 purgeAll()
 
 local function resolveGuiParent()
     local okPg, pg = pcall(function() return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5) end)
-    if okPg and pg then warn("[EHF] Using PlayerGui."); return pg end
+    if okPg and pg then return pg end
     local okCg, cg = pcall(function() return CoreGui end)
-    if okCg and cg then warn("[EHF] Using CoreGui."); return cg end
+    if okCg and cg then return cg end
     local okHui, hui = pcall(function() return gethui and gethui() end)
-    if okHui and hui then warn("[EHF] Using gethui()."); return hui end
+    if okHui and hui then return hui end
     return nil
 end
 local guiParent = resolveGuiParent()
@@ -66,17 +68,15 @@ local CONFIG = {
     SWITCH_CHECK_INTERVAL = 0.5,
     ATTACK_TIMEOUT = 15,
     TARGET_DIST_LOG_INTERVAL = 5,
-    ROLL_WINDOW_SECONDS = 60,
     NPC_SCAN_RADIUS = 60,
     NPC_SCAN_INTERVAL = 3,
     PUMPKIN_TICK_INTERVAL = 0.05,
     GACHA_WINDOW_SECONDS = 3600,
     GACHA_MAX_ROLLS = 2,
-    EVADE_HP_THRESHOLD = 0.30,
-    EVADE_RECOVER_HP = 0.60,
-    EVADE_HEIGHT = 80,
-    EVADE_CHECK_INTERVAL = 0.25,
-    FRUIT_GUARD_CHECK_INTERVAL = 1.0,
+    AUTO_BUY_INTERVAL = 8,
+    AUTO_BUY_PENDING_GUARD = 40,
+    WAIT_MESSAGE_SCAN_ATTEMPTS = 8,
+    WAIT_MESSAGE_SCAN_DELAY = 0.4,
 }
 
 local THEME = {
@@ -92,6 +92,8 @@ local THEME = {
     Yellow = Color3.fromRGB(245, 220, 90),
     Danger = Color3.fromRGB(120, 40, 60),
     Selected = Color3.fromRGB(120, 60, 180),
+    ToggleOn = Color3.fromRGB(40, 120, 60),
+    ToggleOff = Color3.fromRGB(120, 40, 50),
 }
 
 local FONT_REG = Enum.Font.Arial
@@ -101,7 +103,6 @@ do
     if ok then FONT_REG = Enum.Font.SourceSans; FONT_BOLD = Enum.Font.SourceSansBold end
 end
 
--- STATE
 local pumpkinFarm = {
     running = false, thread = nil, state = "IDLE",
     currentPumpkin = nil, currentRoot = nil, flyTarget = nil,
@@ -128,13 +129,15 @@ local gacha = {
     nextResetAt = nil,
 }
 
+local autoBuyEnabled = false
+local lastAutoBuyAttempt = 0
+
 local lastStoreAttempt = nil
 local storeHookActive = false
 local recentDeathAt = nil
 local lastTotInteractionAt = nil
 local npcLastScan = 0
 
--- LOGGING
 local function timestamp()
     local ok, res = pcall(function() return os.date("%H:%M:%S") end)
     if ok and res then return res end
@@ -170,7 +173,6 @@ local function addLog(tag, msg)
     if updateSummary then updateSummary() end
 end
 
--- UI HELPERS
 local function applyCorner(f, r)
     pcall(function()
         local c = Instance.new("UICorner")
@@ -227,19 +229,18 @@ local function makeButton(parent, text, size, pos)
     return b
 end
 
--- Forward
 local refreshStatsTab, refreshFruitList, updateCountdownLabels, readCandyCorn, checkCandyCornChange, seedExistingFruits
-local recordGachaRoll, resetGachaWindow
+local recordGachaRoll, resetGachaWindow, watchForWaitMessage, firePurchase
 
--- KNOWN FRUITS (fallback for single-word fruit names)
 local KNOWN_FRUITS = {
-    kilo=true, mega=true, chop=true, spring=true, bomb=true, smoke=true, spike=true,
+    kilo=true, chop=true, spring=true, bomb=true, smoke=true, spike=true,
     flame=true, falcon=true, ice=true, sand=true, dark=true, diamond=true, light=true,
     rubber=true, barrier=true, magma=true, door=true, buddha=true, love=true, spider=true,
     sound=true, phoenix=true, portal=true, rumble=true, paw=true, gravity=true, dough=true,
     shadow=true, venom=true, control=true, spirit=true, dragon=true, leopard=true, kitsune=true,
     gas=true, blade=true, rocket=true, spin=true, bird=true, human=true, revive=true,
-    creation=true, yeti=true, dough=true, trex=true, mammoth=true, gas=true,
+    creation=true, yeti=true, trex=true, mammoth=true, t-rex=true, light=true, quake=true,
+    string=true, chop=true, bomb=true, barrier=true, rumble=true, gum=true,
 }
 local function looksLikeFruit(name)
     local n = tostring(name)
@@ -260,7 +261,6 @@ local function statusText(s)
     return "UNKNOWN"
 end
 
--- STORE HOOK
 local function tryHookStore()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
@@ -302,12 +302,10 @@ local function tryHookStore()
         okHook = true
     end)
     if okHook then storeHookActive = true; warn("[EHF] Store hook active (raw)."); return true end
-    warn("[EHF] Store hook unavailable.")
     return false
 end
 tryHookStore()
 
--- DEATH
 local function bindHumanoid(hum)
     if not hum then return end
     pcall(function()
@@ -326,7 +324,6 @@ player.CharacterAdded:Connect(function(c)
     if h then bindHumanoid(h) end
 end)
 
--- CANDY CORN
 readCandyCorn = function()
     local best, source
     for k, v in pairs(player:GetAttributes()) do
@@ -357,12 +354,11 @@ checkCandyCornChange = function()
             stats.totCandyCorn = stats.totCandyCorn + delta; tag = "TOT"
         elseif pumpkinFarm.lastKillTime and now - pumpkinFarm.lastKillTime < 3 then tag = "FARM"
         else tag = "CC" end
-        addLog(tag, "Candy Corn +" .. delta .. " (" .. tag .. ")")
+        addLog(tag, "Candy Corn +" .. delta)
     end
     stats.lastCandyCorn = current
 end
 
--- FRUIT SCAN
 seedExistingFruits = function()
     if fruitSeeded then return end
     for _, cont in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
@@ -375,8 +371,25 @@ seedExistingFruits = function()
         end
     end
     fruitSeeded = true
-    warn("[EHF] Seeded pre-existing fruits (not tracked as gacha).")
+    warn("[EHF] Seeded pre-existing fruits (ignored by Fruit Guard).")
 end
+
+-- Fruit Guard: ONLY tracked (gacha-rolled) fruits trigger pause
+local function fruitInInventory()
+    for _, cont in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
+        if cont then
+            for _, child in ipairs(cont:GetChildren()) do
+                if child:IsA("Tool") and looksLikeFruit(child.Name) then
+                    local meta = observedFruitTools[child]
+                    if meta and meta.tracked then return child.Name end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Any new fruit after load = a roll (no window needed)
 local function scanForNewFruits()
     if not fruitSeeded then seedExistingFruits() end
     local present = {}
@@ -386,20 +399,15 @@ local function scanForNewFruits()
                 if child:IsA("Tool") and looksLikeFruit(child.Name) then
                     present[child] = child.Name
                     if not observedFruitTools[child] then
-                        if gacha.pendingRollWindowUntil and os.clock() < gacha.pendingRollWindowUntil then
-                            local h = fruitHistory[child.Name]
-                            if not h then h = { count = 0, status = "inventory", lastSeen = os.clock() }; fruitHistory[child.Name] = h end
-                            h.count = h.count + 1
-                            h.status = "inventory"
-                            h.lastSeen = os.clock()
-                            observedFruitTools[child] = { name = child.Name, tracked = true, seenAt = os.clock() }
-                            gacha.pendingRollWindowUntil = nil
-                            addLog("FRUIT", "Gacha roll confirmed: " .. child.Name .. " (×" .. h.count .. ")")
-                            fruitDirty = true
-                            recordGachaRoll("fruit: " .. child.Name)
-                        else
-                            observedFruitTools[child] = { name = child.Name, tracked = false, seenAt = os.clock() }
-                        end
+                        local h = fruitHistory[child.Name]
+                        if not h then h = { count = 0, status = "inventory", lastSeen = os.clock() }; fruitHistory[child.Name] = h end
+                        h.count = h.count + 1
+                        h.status = "inventory"
+                        h.lastSeen = os.clock()
+                        observedFruitTools[child] = { name = child.Name, tracked = true, seenAt = os.clock() }
+                        addLog("FRUIT", "New fruit detected: " .. child.Name .. " (×" .. h.count .. ")")
+                        fruitDirty = true
+                        recordGachaRoll("fruit appeared: " .. child.Name)
                     end
                 end
             end
@@ -414,7 +422,7 @@ local function scanForNewFruits()
                     local stored = lastStoreAttempt and lastStoreAttempt.fruit == meta.name and (os.clock() - lastStoreAttempt.time < 10)
                     local died = recentDeathAt and (os.clock() - recentDeathAt < 15)
                     if stored then h.status = "stored"; addLog("FRUIT", "Stored: " .. meta.name)
-                    elseif died then h.status = "lost"; addLog("FRUIT", "Lost on death (inferred): " .. meta.name)
+                    elseif died then h.status = "lost"; addLog("FRUIT", "Lost on death: " .. meta.name)
                     else h.status = "unknown"; addLog("FRUIT", "Disappeared: " .. meta.name) end
                     fruitDirty = true
                 end
@@ -423,13 +431,31 @@ local function scanForNewFruits()
     end
 end
 
--- FRUIT GUARD: pause farm when real fruit is in inventory
-local function fruitInInventory()
-    for _, cont in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
-        if cont then
-            for _, child in ipairs(cont:GetChildren()) do
-                if child:IsA("Tool") and looksLikeFruit(child.Name) then
-                    return child.Name
+-- Scan PlayerGui for the "wait xx:xx" cooldown message
+watchForWaitMessage = function()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local ok, descs = pcall(function() return pg:GetDescendants() end)
+    if not ok then return nil end
+    for _, desc in ipairs(descs) do
+        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+            local ourGui = false
+            local cur = desc
+            while cur do
+                if cur.Name == "ElitesHalloweenFarm" then ourGui = true; break end
+                cur = cur.Parent
+            end
+            if not ourGui then
+                local t = desc.Text
+                if type(t) == "string" then
+                    local lower = t:lower()
+                    if lower:find("wait", 1, true) or lower:find("cooldown", 1, true) then
+                        local m, s = t:match("(%d+):(%d+)")
+                        if m and s then
+                            local total = tonumber(m) * 60 + tonumber(s)
+                            if total > 0 and total < 86400 then return total end
+                        end
+                    end
                 end
             end
         end
@@ -437,21 +463,35 @@ local function fruitInInventory()
     return nil
 end
 
--- GACHA WINDOW
+local function scheduleWaitScan()
+    for i = 1, CONFIG.WAIT_MESSAGE_SCAN_ATTEMPTS do
+        task.delay(i * CONFIG.WAIT_MESSAGE_SCAN_DELAY, function()
+            local waitSec = watchForWaitMessage()
+            if waitSec and waitSec > 3 then
+                gacha.nextResetAt = os.clock() + waitSec
+                gacha.rollsUsed = CONFIG.GACHA_MAX_ROLLS
+                addLog("GACHA", string.format("Detected cooldown: %ds (%02d:%02d)", waitSec, math.floor(waitSec/60), waitSec%60))
+                updateCountdownLabels()
+            end
+        end)
+    end
+end
+
 updateCountdownLabels = function()
     if not gachaTimerLabel then return end
     if gacha.nextResetAt then
         local remain = math.max(0, gacha.nextResetAt - os.clock())
-        gachaTimerLabel.Text = string.format("%02d:%02d", math.floor(remain/60), math.floor(remain%60))
-        gachaTimerLabel.TextColor3 = THEME.Yellow
-        gachaStatusLabel.Text = string.format("Cooldown (%d/%d rolls used)", gacha.rollsUsed, CONFIG.GACHA_MAX_ROLLS)
-        gachaStatusLabel.TextColor3 = THEME.Yellow
         if remain <= 0 then
             gacha.rollsUsed = 0
             gacha.nextResetAt = nil
-            addLog("GACHA", "1h window expired — 2 rolls available again.")
+            addLog("GACHA", "Cooldown expired — rolls ready.")
             updateCountdownLabels()
+            return
         end
+        gachaTimerLabel.Text = string.format("%02d:%02d", math.floor(remain/60), math.floor(remain%60))
+        gachaTimerLabel.TextColor3 = THEME.Yellow
+        gachaStatusLabel.Text = string.format("Cooldown (%d/%d used)", gacha.rollsUsed, CONFIG.GACHA_MAX_ROLLS)
+        gachaStatusLabel.TextColor3 = THEME.Yellow
     else
         gachaTimerLabel.Text = "READY"
         gachaTimerLabel.TextColor3 = THEME.Green
@@ -459,15 +499,17 @@ updateCountdownLabels = function()
         gachaStatusLabel.TextColor3 = THEME.Green
     end
 end
+
 recordGachaRoll = function(source)
     gacha.rollsUsed = gacha.rollsUsed + 1
-    addLog("GACHA", string.format("Roll counted (%d/%d) — %s", gacha.rollsUsed, CONFIG.GACHA_MAX_ROLLS, tostring(source)))
+    addLog("GACHA", string.format("Roll %d/%d — %s", gacha.rollsUsed, CONFIG.GACHA_MAX_ROLLS, tostring(source)))
     if gacha.rollsUsed >= CONFIG.GACHA_MAX_ROLLS and not gacha.nextResetAt then
         gacha.nextResetAt = os.clock() + CONFIG.GACHA_WINDOW_SECONDS
-        addLog("GACHA", "2 rolls used. Starting 1h countdown.")
+        addLog("GACHA", "2 rolls used — starting 1h estimate. (Real cooldown will override if detected.)")
     end
     updateCountdownLabels()
 end
+
 resetGachaWindow = function(reason)
     gacha.rollsUsed = 0
     gacha.nextResetAt = nil
@@ -476,11 +518,10 @@ resetGachaWindow = function(reason)
     updateCountdownLabels()
 end
 
--- BUILD UI
 local screenGui, main, header
 local headerH = 44
 local tabRowH = 26
-local featureScroll, startAllBtn, stopAllBtn, loggingBtn, clearBtn, copyBtn, buyGachaBtn
+local featureScroll, startAllBtn, stopAllBtn, loggingBtn, clearBtn, copyBtn, autoBuyBtn
 local minBtn, closeBtn
 local speedLabel, speedFill, speedThumb
 local weaponMeleeBtn, weaponSwordBtn
@@ -632,7 +673,7 @@ local function buildUI()
     header.ZIndex = 3
     local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
     title.ZIndex = 4
-    local sub = makeLabel(header, "v11 · 1h timer · fruit guard · evade", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+    local sub = makeLabel(header, "v12 · auto-buy · real timer", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
     sub.ZIndex = 4
     minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
     minBtn.ZIndex = 5
@@ -669,14 +710,15 @@ local function buildUI()
     stopAllBtn = makeButton(toolbar, "Stop All", UDim2.fromOffset(84, 28), UDim2.fromOffset(92, 4))
     stopAllBtn.ZIndex = 5
     loggingBtn = makeButton(toolbar, "Logging: ON", UDim2.fromOffset(108, 28), UDim2.fromOffset(180, 4))
+    loggingBtn.BackgroundColor3 = THEME.ToggleOn
     loggingBtn.ZIndex = 5
     clearBtn = makeButton(toolbar, "Clear Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(4, 36))
     clearBtn.ZIndex = 5
     copyBtn = makeButton(toolbar, "Copy Logs", UDim2.fromOffset(84, 26), UDim2.fromOffset(92, 36))
     copyBtn.ZIndex = 5
-    buyGachaBtn = makeButton(toolbar, "Buy Gacha", UDim2.fromOffset(108, 26), UDim2.fromOffset(180, 36))
-    buyGachaBtn.BackgroundColor3 = Color3.fromRGB(80, 46, 70)
-    buyGachaBtn.ZIndex = 5
+    autoBuyBtn = makeButton(toolbar, "Auto Buy: OFF", UDim2.fromOffset(108, 26), UDim2.fromOffset(180, 36))
+    autoBuyBtn.BackgroundColor3 = THEME.ToggleOff
+    autoBuyBtn.ZIndex = 5
 
     local speedRow = Instance.new("Frame")
     speedRow.BackgroundTransparency = 1
@@ -846,7 +888,6 @@ local function buildUI()
     statsContent.Visible = false
     statsContent.Parent = main
 
-    -- Gacha section (110px, with Mark Roll + Reset)
     local gachaSec = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, 110), UDim2.fromOffset(0, 0), "GachaSec")
     gachaSec.ZIndex = 4
     local gTitle = makeLabel(gachaSec, "GACHA TIMER", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
@@ -866,11 +907,10 @@ local function buildUI()
     markRollBtn.MouseButton1Click:Connect(function() recordGachaRoll("manual") end)
     local resetBtn = makeButton(gachaSec, "Reset", UDim2.fromOffset((contentWidth - 24) / 2, 24), UDim2.fromOffset(16 + (contentWidth - 24) / 2, 76))
     resetBtn.TextSize = 11
-    resetBtn.BackgroundColor3 = Color3.fromRGB(60, 50, 40)
+    resetBtn.BackgroundColor3 = THEME.ToggleOff
     resetBtn.ZIndex = 6
     resetBtn.MouseButton1Click:Connect(function() resetGachaWindow("manual") end)
 
-    -- Counters section
     local countersSec = makeFrame(statsContent, THEME.Panel, UDim2.new(1, 0, 0, 92), UDim2.fromOffset(0, 116), "CountersSec")
     countersSec.ZIndex = 4
     local cT = makeLabel(countersSec, "FARM STATS", UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 4), 10, THEME.Accent, true)
@@ -900,7 +940,6 @@ local function buildUI()
     pumpkinsFarmedLabel = addCounterRow(44, "Pumpkins Farmed:")
     totCandyCornLabel = addCounterRow(66, "ToT Candy Corn:")
 
-    -- Fruit history
     local fruitY = 116 + 98
     local fruitH = contentHeight - fruitY
     if fruitH < 60 then fruitH = 60 end
@@ -937,7 +976,6 @@ if not okBuild or not screenGui then
     return
 end
 
--- FEATURE REGISTRY
 local features = {}
 local featureOrder = {}
 updateSummary = function()
@@ -957,7 +995,7 @@ end
 local function refreshFeature(f)
     if not f then return end
     f.btn.Text = f.running and "Stop" or "Start"
-    f.btn.BackgroundColor3 = f.running and Color3.fromRGB(90, 32, 52) or THEME.Button
+    f.btn.BackgroundColor3 = f.running and THEME.ToggleOn or THEME.ToggleOff
     if f.statusLabel then f.statusLabel.TextColor3 = f.running and THEME.Green or THEME.Muted end
 end
 local function setFeatureRunning(id, running, silent)
@@ -994,6 +1032,7 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
     local s = makeLabel(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted, false)
     s.ZIndex = 5; s.TextTruncate = Enum.TextTruncate.AtEnd
     local btn = makeButton(row, "Start", UDim2.fromOffset(64, 28), UDim2.new(1, -74, 0, 5))
+    btn.BackgroundColor3 = THEME.ToggleOff
     btn.ZIndex = 6
     if extraText then
         local eB = makeButton(row, extraText, UDim2.fromOffset(64, 22), UDim2.new(1, -74, 0, 35))
@@ -1013,7 +1052,6 @@ local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, ex
     return f
 end
 
--- REMOTES
 local function getNet()
     local m = ReplicatedStorage:FindFirstChild("Modules")
     return m and m:FindFirstChild("Net")
@@ -1033,7 +1071,6 @@ local function getRegisterHit()
     local n = getNet(); return n and n:FindFirstChild("RE/RegisterHit")
 end
 
--- SAFE FLY
 local function computeSafeFlyTarget(targetPos, pumpkinModel)
     local safeY = targetPos.Y + CONFIG.FLY_HOVER_HEIGHT
     local params = RaycastParams.new()
@@ -1059,7 +1096,6 @@ local function computeSafeFlyTarget(targetPos, pumpkinModel)
     return Vector3.new(targetPos.X, safeY, targetPos.Z)
 end
 
--- WEAPONS
 local MELEE_STYLES = { "combat","dark step","electric","water kung fu","dragon breath","superhuman","death step","sharkman karate","electric claw","dragon talon","godhuman","sanguine art" }
 local function isMeleeStyle(name)
     local n = tostring(name):lower()
@@ -1089,7 +1125,6 @@ local function equipWeaponOfCategory(category)
     return nil
 end
 
--- NEAREST PUMPKIN
 local function findClosestPumpkin()
     local hunt = Workspace:FindFirstChild("PumpkinHunt")
     if not hunt then return nil, nil, nil end
@@ -1125,7 +1160,6 @@ local function fireRegisterHit(rootPart)
     return (pcall(function() r:FireServer(rootPart) end))
 end
 
--- RENDER LOOP (smooth fly + noclip + velocity zeroing + instant flyTarget)
 RunService.RenderStepped:Connect(function(dt)
     if not pumpkinFarm.running then return end
     local char = player.Character
@@ -1133,7 +1167,6 @@ RunService.RenderStepped:Connect(function(dt)
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then return end
-
     if hum ~= pumpkinFarm.lastHumanoid then
         pumpkinFarm.lastHumanoid = hum
         noclipParts = {}
@@ -1150,18 +1183,15 @@ RunService.RenderStepped:Connect(function(dt)
         pumpkinFarm.evading = false
         pcall(function() hum.PlatformStand = true end)
     end
-
     for _, part in ipairs(char:GetChildren()) do
         if part:IsA("BasePart") and part.CanCollide then
             part.CanCollide = false
             noclipParts[part] = true
         end
     end
-
     if pumpkinFarm.state == "MOVING" and not pumpkinFarm.flyTarget and pumpkinFarm.currentRoot and pumpkinFarm.currentRoot.Parent then
         pumpkinFarm.flyTarget = computeSafeFlyTarget(pumpkinFarm.currentRoot.Position, pumpkinFarm.currentPumpkin)
     end
-
     if pumpkinFarm.flyTarget then
         pcall(function()
             hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1177,7 +1207,6 @@ RunService.RenderStepped:Connect(function(dt)
     end
 end)
 
--- PUMPKIN TICK
 local function resetStuckTracking()
     pumpkinFarm.stuckTime = 0
     pumpkinFarm.lastDistance = nil
@@ -1208,13 +1237,11 @@ local function blacklistTarget(reason)
     resetStuckTracking()
 end
 
--- FRUIT GUARD / EVADE state
 local fruitGuardPaused = false
 local lastEvadeCheck = 0
 
 local function checkFruitGuard()
     if fruitGuardPaused then
-        -- Check if fruit is gone
         if not fruitInInventory() then
             fruitGuardPaused = false
             setFeatureStatus("fruitguard", "clear — resuming")
@@ -1225,8 +1252,8 @@ local function checkFruitGuard()
     local f = fruitInInventory()
     if f then
         fruitGuardPaused = true
-        setFeatureStatus("fruitguard", "PAUSED: carrying " .. f)
-        addLog("GUARD", "FARM PAUSED — fruit in inventory: " .. f .. ". Store it, then farm resumes.")
+        setFeatureStatus("fruitguard", "PAUSED: " .. f)
+        addLog("GUARD", "FARM PAUSED — rolled fruit in inventory: " .. f)
         pumpkinFarm.flyTarget = nil
         pumpkinFarm.currentPumpkin = nil
         pumpkinFarm.currentRoot = nil
@@ -1253,13 +1280,13 @@ local function checkDefensiveEvade()
             pumpkinFarm.flyTarget = hrp.Position + Vector3.new(0, CONFIG.EVADE_HEIGHT, 0)
             pumpkinFarm.state = "EVADING"
             setFeatureStatus("evade", string.format("EVADING (HP %.0f%%)", ratio * 100))
-            addLog("EVADE", string.format("HP %.0f%% < %.0f%% — flying up to disengage.", ratio * 100, CONFIG.EVADE_HP_THRESHOLD * 100))
+            addLog("EVADE", string.format("HP %.0f%% < %.0f%% — flying up.", ratio * 100, CONFIG.EVADE_HP_THRESHOLD * 100))
         end
     else
         if ratio >= CONFIG.EVADE_RECOVER_HP then
             pumpkinFarm.evading = false
-            setFeatureStatus("evade", string.format("recovered (HP %.0f%%)", ratio * 100))
-            addLog("EVADE", "HP recovered — resuming farm.")
+            setFeatureStatus("evade", string.format("recovered (%.0f%%)", ratio * 100))
+            addLog("EVADE", "HP recovered — resuming.")
         else
             setFeatureStatus("evade", string.format("EVADING (HP %.0f%%)", ratio * 100))
             if not pumpkinFarm.flyTarget then
@@ -1273,17 +1300,12 @@ local function pumpkinFarmTick()
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then setFeatureStatus("pumpkin", "no character"); return end
-
-    -- Priority 1: defensive evade
     if pumpkinFarm.evading then return end
-    -- Priority 2: fruit guard
     if fruitGuardPaused then return end
-
     local now = os.clock()
     for k, v in pairs(pumpkinFarm.blacklist) do
         if v < now or not k.Parent then pumpkinFarm.blacklist[k] = nil end
     end
-
     if pumpkinFarm.currentPumpkin then
         local p = pumpkinFarm.currentPumpkin
         local r = pumpkinFarm.currentRoot
@@ -1300,7 +1322,6 @@ local function pumpkinFarmTick()
             resetStuckTracking()
         end
     end
-
     if not pumpkinFarm.currentPumpkin then
         local p, r, dist = findClosestPumpkin()
         if p and r then
@@ -1314,12 +1335,10 @@ local function pumpkinFarmTick()
             return
         end
     end
-
     local root = pumpkinFarm.currentRoot
     local pumpkin = pumpkinFarm.currentPumpkin
     if not root or not pumpkin then return end
     local dist = (root.Position - hrp.Position).Magnitude
-
     if pumpkinFarm.state == "MOVING" and dist > CONFIG.SWITCH_MIN_DIST then
         if os.clock() - pumpkinFarm.lastSwitchCheck > CONFIG.SWITCH_CHECK_INTERVAL then
             pumpkinFarm.lastSwitchCheck = os.clock()
@@ -1330,12 +1349,10 @@ local function pumpkinFarmTick()
             end
         end
     end
-
     if os.clock() - pumpkinFarm.lastDistLog > CONFIG.TARGET_DIST_LOG_INTERVAL then
         pumpkinFarm.lastDistLog = os.clock()
         addLog("PUMPKIN", string.format("Current %s: %.1f studs", tostring(pumpkin.Name), dist))
     end
-
     if pumpkinFarm.state == "MOVING" then
         if pumpkinFarm.lastDistance then
             if (pumpkinFarm.lastDistance - dist) < CONFIG.PROGRESS_THRESHOLD then
@@ -1354,7 +1371,6 @@ local function pumpkinFarmTick()
         if pumpkinFarm.stuckTime >= CONFIG.STUCK_TIMEOUT then blacklistTarget(string.format("no progress %.1fs", pumpkinFarm.stuckTime)); return end
         if pumpkinFarm.oscillationCount >= CONFIG.OSCILLATION_THRESHOLD then blacklistTarget(string.format("Y-osc x%d", pumpkinFarm.oscillationCount)); return end
     end
-
     if dist > CONFIG.TOUCH_DISTANCE then
         if not pumpkinFarm.flyTarget then pumpkinFarm.flyTarget = computeSafeFlyTarget(root.Position, pumpkin) end
         pumpkinFarm.state = "MOVING"
@@ -1399,6 +1415,7 @@ local function pumpkinFarmStart()
     pumpkinFarm.lastDistLog = 0
     pumpkinFarm.lastSwitchCheck = 0
     pumpkinFarm.evading = false
+    fruitGuardPaused = false
     resetStuckTracking()
     noclipParts = {}
     addLog("PUMPKIN", string.format("Started. %d/s, %s.", pumpkinFarm.speed, pumpkinFarm.weaponCategory))
@@ -1421,6 +1438,7 @@ local function stopPumpkinFarm()
     pumpkinFarm.lastRespawnAt = nil
     pumpkinFarm.weaponEquippedFor = nil
     pumpkinFarm.evading = false
+    fruitGuardPaused = false
     resetStuckTracking()
     for part in pairs(noclipParts) do
         pcall(function() if part.Parent and part:IsA("BasePart") then part.CanCollide = true end end)
@@ -1433,10 +1451,9 @@ local function stopPumpkinFarm()
     addLog("PUMPKIN", "Stopped.")
 end
 
--- FRUIT GUARD feature
 local function fruitGuardStart()
     fruitGuardPaused = false
-    addLog("GUARD", "Started. Farm will pause if a real fruit is carried.")
+    addLog("GUARD", "Started. Farm will pause only when a *newly rolled* fruit is in inventory.")
 end
 local function fruitGuardStop()
     fruitGuardPaused = false
@@ -1448,23 +1465,19 @@ local function fruitGuardTick()
     else setFeatureStatus("fruitguard", "clear") end
 end
 
--- DEFENSIVE EVADE feature
 local function evadeStart()
     lastEvadeCheck = 0
     pumpkinFarm.evading = false
-    addLog("EVADE", string.format("Started. HP < %.0f%% → fly up %d studs. No attacks.", CONFIG.EVADE_HP_THRESHOLD * 100, CONFIG.EVADE_HEIGHT))
+    addLog("EVADE", string.format("Started. HP < %.0f%% → fly up. No attacks.", CONFIG.EVADE_HP_THRESHOLD * 100))
 end
 local function evadeStop()
     pumpkinFarm.evading = false
     addLog("EVADE", "Stopped.")
 end
 local function evadeTick()
-    if not pumpkinFarm.running then
-        setFeatureStatus("evade", "needs Auto Pumpkin Farm on")
-    end
+    if not pumpkinFarm.running then setFeatureStatus("evade", "needs Auto Pumpkin Farm on") end
 end
 
--- TRICK OR TREAT (unchanged)
 local trickOrTreat = { running = false, thread = nil, delay = 1.5 }
 local function setToTStatus(text) setFeatureStatus("treat", text) end
 local function findTrickOrTreatDoors()
@@ -1495,13 +1508,11 @@ local function stopTrickOrTreat()
     trickOrTreat.running = false
     if trickOrTreat.thread then pcall(function() task.cancel(trickOrTreat.thread) end); trickOrTreat.thread = nil end
     setToTStatus("Stopped")
-    addLog("TREAT", "Stopped.")
 end
 local function trickOrTreatStart()
     if trickOrTreat.running then return end
     trickOrTreat.running = true
     setToTStatus("Searching...")
-    addLog("TREAT", "Started.")
     trickOrTreat.thread = task.spawn(function()
         while trickOrTreat.running do
             local ok, err = pcall(function()
@@ -1534,9 +1545,7 @@ local function trickOrTreatStart()
                         if remote then
                             pcall(function() remote:FireServer(best) end)
                             addLog("TREAT", "OnTalkToNPC on " .. best.Name)
-                        else
-                            setToTStatus("Error: no method")
-                        end
+                        else setToTStatus("Error: no method") end
                     end
                     lastTotInteractionAt = os.clock()
                     setToTStatus("Waiting")
@@ -1553,7 +1562,6 @@ local function trickOrTreatStart()
     end)
 end
 
--- EVENT OBSERVER
 local eventObserver = { running = false, thread = nil, connections = {}, known = {} }
 local EVENT_KEYWORDS = { "trick","treat","dapper","cursed","seed","spooky","jack","pumpkin","halloween" }
 local function isEventObject(inst)
@@ -1572,7 +1580,6 @@ local function stopEventObserver()
     eventObserver.connections = {}
     eventObserver.known = {}
     if eventObserver.thread then pcall(function() task.cancel(eventObserver.thread) end); eventObserver.thread = nil end
-    addLog("EVENT", "Stopped.")
 end
 local function eventObserverStart()
     if eventObserver.running then return end
@@ -1603,7 +1610,6 @@ local function eventObserverStart()
     end)
 end
 
--- MATERIAL SCANNER
 local MATERIAL_KEYWORDS = { "candy","corn","pumpkin","bit","seed","treat","halloween","spooky","soul","bone" }
 local function hasMatKeyword(name)
     local s = tostring(name):lower()
@@ -1648,7 +1654,6 @@ local function matTick()
     setFeatureStatus("materials", tostring(n) .. " value(s)")
 end
 
--- GACHA MONITOR
 local gachaLastPresent = nil
 local function invokeGachaContext(context)
     local rf = getGachaRF()
@@ -1678,27 +1683,30 @@ local function gachaTick()
     end
     setFeatureStatus("gacha", present and "remote present" or "remote missing")
 end
-local purchaseConfirmUntil = 0
-local function requestGachaPurchase()
-    if os.clock() < purchaseConfirmUntil then
-        purchaseConfirmUntil = 0
-        addLog("GACHA", "Manual Purchase fired.")
-        gacha.lastPurchaseAttemptAt = os.clock()
-        gacha.pendingRollWindowUntil = os.clock() + CONFIG.ROLL_WINDOW_SECONDS
-        invokeGachaContext("Purchase")
-    else
-        purchaseConfirmUntil = os.clock() + 5
-        addLog("WARN", "Tap Buy Gacha again within 5s to confirm.")
-    end
+
+firePurchase = function(source)
+    gacha.lastPurchaseAttemptAt = os.clock()
+    gacha.pendingRollWindowUntil = os.clock() + 60
+    addLog("GACHA", "Purchase fired (" .. tostring(source) .. ").")
+    invokeGachaContext("Purchase")
+    scheduleWaitScan()
 end
 
--- FRUIT OBSERVER
+local function autoBuyTick()
+    if not autoBuyEnabled then return end
+    if not pumpkinFarm.running then return end
+    if gacha.nextResetAt and gacha.nextResetAt > os.clock() + 2 then return end
+    if os.clock() - lastAutoBuyAttempt < CONFIG.AUTO_BUY_INTERVAL then return end
+    if gacha.pendingRollWindowUntil and os.clock() < gacha.pendingRollWindowUntil - CONFIG.AUTO_BUY_PENDING_GUARD then return end
+    if gacha.rollsUsed >= CONFIG.GACHA_MAX_ROLLS and gacha.nextResetAt then return end
+    lastAutoBuyAttempt = os.clock()
+    addLog("GACHA", "Auto-buy firing Purchase.")
+    firePurchase("auto")
+end
+
 local function fruitStart() addLog("FRUIT", "Observer started.") end
-local function fruitTick()
-    scanForNewFruits()
-end
+local function fruitTick() scanForNewFruits() end
 
--- RESPAWN
 local respawnEndsAt, respawnNotified = nil, true
 local function respawnStart() addLog("RESPAWN", "Started.") end
 local function respawnTick()
@@ -1710,12 +1718,9 @@ local function respawnTick()
             setFeatureStatus("respawn", "Reached")
             respawnEndsAt = nil
         end
-    else
-        setFeatureStatus("respawn", "waiting")
-    end
+    else setFeatureStatus("respawn", "waiting") end
 end
 
--- DIAG
 local DIAG_PATHS = {
     { "Remotes", "OnTalkToNPC" },
     { "Modules", "Net", "RF/GachaNetworkRF" },
@@ -1738,9 +1743,8 @@ end
 local function diagStart() diagLast = 0; addLog("DIAG", "Started."); runDiag(true) end
 local function diagTick() if os.clock() - diagLast < 15 then return end; diagLast = os.clock(); runDiag(false) end
 
--- NPC DETECT
 local npcKnown = {}
-local function npcStart() addLog("NPC", "Started. Diagnostic only."); npcKnown = {} end
+local function npcStart() addLog("NPC", "Started."); npcKnown = {} end
 local function npcStop() addLog("NPC", "Stopped."); npcKnown = {} end
 local function npcTick()
     if os.clock() - npcLastScan < CONFIG.NPC_SCAN_INTERVAL then return end
@@ -1764,29 +1768,25 @@ local function npcTick()
             end
         end
     end
-    for obj in pairs(found) do
-        if not npcKnown[obj] then npcKnown[obj] = true end
-    end
+    for obj in pairs(found) do if not npcKnown[obj] then npcKnown[obj] = true end end
     for obj in pairs(npcKnown) do if not found[obj] then npcKnown[obj] = nil end end
     local n = 0
     for _ in pairs(found) do n = n + 1 end
     setFeatureStatus("npc", tostring(n) .. " nearby")
 end
 
--- REGISTER
 addFeature("pumpkin", "Auto Pumpkin Farm", "Nearest + smooth fly + water-safe + noclip.", pumpkinFarmStart, stopPumpkinFarm, nil)
-addFeature("fruitguard", "Fruit Guard", "Pauses farm when you carry a fruit. Prevents fruit loss.", fruitGuardStart, fruitGuardStop, fruitGuardTick)
-addFeature("evade", "Defensive Evade", "HP < 30% → fly up 80 studs. No attacks. Prevents death.", evadeStart, evadeStop, evadeTick)
+addFeature("fruitguard", "Fruit Guard", "Pauses farm only when a *rolled* fruit is carried.", fruitGuardStart, fruitGuardStop, fruitGuardTick)
+addFeature("evade", "Defensive Evade", "HP < 30% → fly up. No attacks.", evadeStart, evadeStop, evadeTick)
 addFeature("treat", "Auto Trick or Treat", "Best-effort door search + interaction.", trickOrTreatStart, stopTrickOrTreat, nil)
 addFeature("events", "Event Keyword Observer", "Event-driven.", eventObserverStart, stopEventObserver, nil)
 addFeature("materials", "Material Scanner", "Attributes, leaderstats, tools.", matStart, nil, matTick)
-addFeature("gacha", "Halloween Gacha Monitor", "Presence + probes. Use Check for pity data.", gachaStart, nil, gachaTick, "Check", probeGacha)
-addFeature("fruits", "Fruit Inventory Observer", "Tracks gacha roll / storage / loss.", fruitStart, nil, fruitTick)
+addFeature("gacha", "Halloween Gacha Monitor", "Presence + probes. Auto Buy toggles Purchase.", gachaStart, nil, gachaTick, "Check", probeGacha)
+addFeature("fruits", "Fruit Inventory Observer", "Tracks gacha rolls (all new fruits).", fruitStart, nil, fruitTick)
 addFeature("respawn", "Respawn Countdown", "690s local estimate.", respawnStart, nil, respawnTick)
-addFeature("npc", "NPC Threat Detection", "Diagnostic only, radius " .. CONFIG.NPC_SCAN_RADIUS, npcStart, npcStop, npcTick)
+addFeature("npc", "NPC Threat Detection", "Diagnostic only.", npcStart, npcStop, npcTick)
 addFeature("diag", "Remote Diagnostics", "Captured remotes.", diagStart, nil, diagTick)
 
--- MAIN LOOP
 task.spawn(function()
     while screenGui and screenGui.Parent do
         for _, id in ipairs(featureOrder) do
@@ -1798,12 +1798,12 @@ task.spawn(function()
         end
         pcall(function() checkCandyCornChange(); scanForNewFruits() end)
         pcall(function() updateCountdownLabels() end)
+        pcall(function() autoBuyTick() end)
         pcall(function() if activeTab == "stats" then refreshStatsTab() end end)
         task.wait(CONFIG.FEATURE_TICK)
     end
 end)
 
--- UI ACTIONS
 startAllBtn.MouseButton1Click:Connect(function()
     addLog("FEATURE", "Start All.")
     for _, id in ipairs(featureOrder) do setFeatureRunning(id, true, true) end
@@ -1817,6 +1817,7 @@ end)
 loggingBtn.MouseButton1Click:Connect(function()
     logEnabled = not logEnabled
     loggingBtn.Text = "Logging: " .. (logEnabled and "ON" or "OFF")
+    loggingBtn.BackgroundColor3 = logEnabled and THEME.ToggleOn or THEME.ToggleOff
 end)
 clearBtn.MouseButton1Click:Connect(function()
     logLines = {}
@@ -1828,7 +1829,15 @@ copyBtn.MouseButton1Click:Connect(function()
     local ok = pcall(function() setclipboard(table.concat(logLines, "\n")) end)
     if ok then addLog("SYS", "Copied.") end
 end)
-buyGachaBtn.MouseButton1Click:Connect(requestGachaPurchase)
+autoBuyBtn.MouseButton1Click:Connect(function()
+    autoBuyEnabled = not autoBuyEnabled
+    autoBuyBtn.Text = "Auto Buy: " .. (autoBuyEnabled and "ON" or "OFF")
+    autoBuyBtn.BackgroundColor3 = autoBuyEnabled and THEME.ToggleOn or THEME.ToggleOff
+    addLog("GACHA", "Auto Buy " .. (autoBuyEnabled and "ON" or "OFF"))
+    if autoBuyEnabled then
+        addLog("GACHA", "Will fire Purchase every " .. CONFIG.AUTO_BUY_INTERVAL .. "s when cooldown is clear.")
+    end
+end)
 
 local minimized, savedSize = false, main.Size
 minBtn.MouseButton1Click:Connect(function()
@@ -1842,7 +1851,6 @@ minBtn.MouseButton1Click:Connect(function()
         minBtn.Text = "—"
     end
 end)
-
 closeBtn.MouseButton1Click:Connect(function()
     for _, id in ipairs(featureOrder) do pcall(function() setFeatureRunning(id, false, true) end) end
     task.wait(0.1)
@@ -1869,8 +1877,9 @@ end)
 pcall(checkCandyCornChange)
 pcall(seedExistingFruits)
 refreshStatsTab()
-addLog("SYS", "v11 loaded. Gacha 1h window. Fruit Guard ON. Evade OFF.")
-addLog("SYS", "Auto Pumpkin Farm will pause if you carry a fruit. Store it to resume.")
-if storeHookActive then addLog("SYS", "Store hook active.") else addLog("SYS", "Store hook inactive.") end
+addLog("SYS", "v12 loaded. Fruit Guard only tracks rolled fruits — pre-existing Dark/Flame won't pause.")
+addLog("SYS", "Auto Buy Gacha: toggle button (bottom right toolbar). Fires Purchase on cooldown-clear.")
+addLog("SYS", "Gacha timer reads real 'wait xx:xx' message from the game.")
+if storeHookActive then addLog("SYS", "Store hook active.") end
 updateSummary()
-warn("[EHF] v11 GUI loaded successfully.")
+warn("[EHF] v12 GUI loaded successfully.")

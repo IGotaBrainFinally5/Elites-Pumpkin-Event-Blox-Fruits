@@ -1,83 +1,997 @@
-
--- ELITES HALLOWEEN FARM V3 GUI
--- StarterPlayer > StarterPlayerScripts
+--!nocheck
+-- ELITES HALLOWEEN FARM — client-side observer/helper
+-- For Delta Executor on Android, live Blox Fruits.
+-- This script does NOT create fake remotes, rewards, currencies, enemies, or gacha rolls.
+-- It only observes local client-visible state and calls captured remotes on explicit user action.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
+if not player then
+    return
+end
+
 local playerGui = player:WaitForChild("PlayerGui")
 
-local remotes = ReplicatedStorage:WaitForChild("HalloweenFarmRemotes")
-local Action = remotes:WaitForChild("Action")
-local Update = remotes:WaitForChild("Update")
-local GetState = remotes:WaitForChild("GetState")
+local CONFIG = {
+    GACHA_BOX = "Halloween26Gacha",
+    OBSERVED_PUMPKIN_RESPAWN = 690,
+    MAX_LOG_LINES = 250,
+    FEATURE_TICK = 1,
+}
 
-local old = playerGui:FindFirstChild("ElitesHalloweenFarm")
-if old then old:Destroy() end
+local THEME = {
+    Background = Color3.fromRGB(18, 10, 26),
+    Panel = Color3.fromRGB(32, 20, 48),
+    Button = Color3.fromRGB(58, 34, 88),
+    Border = Color3.fromRGB(98, 54, 150),
+    Accent = Color3.fromRGB(160, 90, 255),
+    Text = Color3.fromRGB(240, 230, 255),
+    Muted = Color3.fromRGB(170, 150, 200),
+    Green = Color3.fromRGB(90, 230, 140),
+    Red = Color3.fromRGB(255, 90, 110),
+    Yellow = Color3.fromRGB(255, 210, 90),
+}
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "ElitesHalloweenFarm"
-gui.ResetOnSpawn = false
-gui.Parent = playerGui
+local function fmt(v)
+    if type(v) == "table" then
+        local ok, res = pcall(function()
+            return HttpService:JSONEncode(v)
+        end)
+        return ok and res or tostring(v)
+    end
+    return tostring(v)
+end
+
+local logEnabled = true
+local logLines = {}
+local logLabel
+local logScroll
+local summaryStatus
+local updateSummary
+
+local function addLog(tag, msg)
+    if not logEnabled and tag ~= "SYS" then
+        return
+    end
+    local line = string.format("%s [%s] %s", os.date("%H:%M:%S"), tostring(tag), tostring(msg))
+    table.insert(logLines, line)
+    while #logLines > CONFIG.MAX_LOG_LINES do
+        table.remove(logLines, 1)
+    end
+    if logLabel then
+        logLabel.Text = table.concat(logLines, "\n")
+        task.defer(function()
+            if logScroll and logLabel then
+                logScroll.CanvasSize = UDim2.new(0, 0, 0, math.max(0, logLabel.AbsoluteSize.Y + 16))
+            end
+        end)
+    end
+    if updateSummary then
+        updateSummary()
+    end
+end
+
+local function corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim2.fromOffset(radius, radius)
+    c.Parent = parent
+    return c
+end
+
+local function stroke(parent, color, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or THEME.Border
+    s.Thickness = thickness or 1
+    s.Parent = parent
+    return s
+end
+
+local function newFrame(parent, color, size, pos)
+    local f = Instance.new("Frame")
+    f.BackgroundColor3 = color or THEME.Panel
+    f.BorderSizePixel = 0
+    f.Size = size
+    f.Position = pos
+    f.Parent = parent
+    return f
+end
+
+local function label(parent, text, size, pos, textSize, color)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = color or THEME.Text
+    l.TextSize = textSize or 14
+    l.Font = Enum.Font.GothamMedium
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Top
+    l.Size = size
+    l.Position = pos
+    l.Parent = parent
+    return l
+end
+
+local function button(parent, text, size, pos)
+    local b = Instance.new("TextButton")
+    b.Text = text
+    b.TextColor3 = THEME.Text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.AutoButtonColor = false
+    b.BackgroundColor3 = THEME.Button
+    b.Size = size
+    b.Position = pos
+    b.Parent = parent
+    corner(b, 8)
+    stroke(b, THEME.Border, 1)
+    return b
+end
+
+local guiParent
+do
+    local ok, hui = pcall(function()
+        return gethui and gethui()
+    end)
+    if ok and hui then
+        guiParent = hui
+    else
+        guiParent = playerGui
+    end
+end
+
+for _, parent in ipairs({ playerGui, guiParent }) do
+    local old = parent:FindFirstChild("ElitesHalloweenFarm")
+    if old then
+        old:Destroy()
+    end
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ElitesHalloweenFarm"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.DisplayOrder = 9999
+screenGui.Parent = guiParent
+
+local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(720, 1280)
+local mainW = math.clamp(viewport.X - 24, 320, 420)
+local mainH = math.clamp(viewport.Y - 80, 460, 560)
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(320, 420)
-main.Position = UDim2.new(0.5, -160, 0.5, -210)
-main.BackgroundColor3 = Color3.fromRGB(20, 19, 30)
+main.Name = "Main"
+main.BackgroundColor3 = THEME.Background
 main.BorderSizePixel = 0
-main.Parent = gui
+main.Position = UDim2.new(0.5, 0, 0.5, 0)
+main.AnchorPoint = Vector2.new(0.5, 0.5)
+main.Size = UDim2.fromOffset(mainW, mainH)
+main.ClipsDescendants = true
+main.Parent = screenGui
+corner(main, 14)
+stroke(main, THEME.Accent, 2)
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 10)
-corner.Parent = main
+local header = newFrame(main, THEME.Panel, UDim2.new(1, 0, 0, 44), UDim2.fromOffset(0, 0))
+corner(header, 14)
+stroke(header, THEME.Border, 1)
 
-local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(150, 75, 220)
-stroke.Thickness = 2
-stroke.Parent = main
-
--- HEADER / DRAG BAR
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 38)
-header.BackgroundColor3 = Color3.fromRGB(40, 28, 55)
-header.BorderSizePixel = 0
-header.Parent = main
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -50, 1, 0)
-title.Position = UDim2.fromOffset(10, 0)
-title.BackgroundTransparency = 1
-title.Text = "🎃 ELITES HALLOWEEN V3"
-title.TextColor3 = Color3.new(1, 1, 1)
+local title = label(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 13
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = header
 
-local close = Instance.new("TextButton")
-close.Size = UDim2.fromOffset(27, 27)
-close.Position = UDim2.new(1, -32, 0, 5)
-close.Text = "X"
-close.BackgroundColor3 = Color3.fromRGB(175, 45, 65)
-close.TextColor3 = Color3.new(1, 1, 1)
-close.Font = Enum.Font.GothamBold
-close.TextSize = 14
-close.Parent = header
+local subtitle = label(header, "Client observer — no fake remotes or rewards", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted)
 
-Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+local minBtn = button(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
+local closeBtn = button(header, "X", UDim2.fromOffset(26, 26), UDim2.new(1, -32, 0, 9))
+closeBtn.BackgroundColor3 = Color3.fromRGB(92, 30, 48)
 
--- DRAGGING
+local headerH = 44
+local content = newFrame(main, THEME.Background, UDim2.new(1, -12, 1, -headerH - 10), UDim2.fromOffset(6, headerH + 4))
+content.BackgroundTransparency = 1
+local contentH = mainH - headerH - 10
+
+local toolbar = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, 66), UDim2.fromOffset(0, 0))
+corner(toolbar, 10)
+stroke(toolbar, THEME.Border, 1)
+
+local startAllBtn = button(toolbar, "Start All", UDim2.fromOffset(86, 28), UDim2.fromOffset(4, 4))
+local stopAllBtn = button(toolbar, "Stop All", UDim2.fromOffset(86, 28), UDim2.fromOffset(94, 4))
+local loggingBtn = button(toolbar, "Logging: ON", UDim2.fromOffset(110, 28), UDim2.fromOffset(184, 4))
+
+local clearBtn = button(toolbar, "Clear Logs", UDim2.fromOffset(86, 26), UDim2.fromOffset(4, 36))
+local copyBtn = button(toolbar, "Copy Logs", UDim2.fromOffset(86, 26), UDim2.fromOffset(94, 36))
+local buyGachaBtn = button(toolbar, "Buy Gacha", UDim2.fromOffset(110, 26), UDim2.fromOffset(184, 36))
+
+local featureY = 72
+local featureH = math.max(80, math.floor(contentH * 0.34))
+local summaryY = featureY + featureH + 6
+local summaryH = 50
+local logY = summaryY + summaryH + 6
+local logH = math.max(60, contentH - logY - 4)
+
+local featureScroll = Instance.new("ScrollingFrame")
+featureScroll.BackgroundColor3 = THEME.Panel
+featureScroll.BorderSizePixel = 0
+featureScroll.Position = UDim2.fromOffset(0, featureY)
+featureScroll.Size = UDim2.new(1, 0, 0, featureH)
+featureScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+featureScroll.ScrollBarThickness = 6
+featureScroll.ScrollBarImageColor3 = THEME.Accent
+featureScroll.Parent = content
+corner(featureScroll, 10)
+stroke(featureScroll, THEME.Border, 1)
+
+local featureLayout = Instance.new("UIListLayout")
+featureLayout.Padding = UDim.new(0, 6)
+featureLayout.SortOrder = Enum.SortOrder.LayoutOrder
+featureLayout.Parent = featureScroll
+
+local summary = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, summaryH), UDim2.fromOffset(0, summaryY))
+corner(summary, 10)
+stroke(summary, THEME.Border, 1)
+
+local summaryTitle = label(summary, "LOCAL STATUS", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent)
+summaryTitle.Font = Enum.Font.GothamBold
+summaryStatus = label(summary, "No features running.", UDim2.new(1, -16, 0, 18), UDim2.fromOffset(8, 24), 11, THEME.Muted)
+
+local logFrame = newFrame(content, THEME.Panel, UDim2.new(1, 0, 0, logH), UDim2.fromOffset(0, logY))
+corner(logFrame, 10)
+stroke(logFrame, THEME.Border, 1)
+
+local logTitle = label(logFrame, "ACTIVITY LOG", UDim2.new(1, -16, 0, 16), UDim2.fromOffset(8, 4), 11, THEME.Accent)
+logTitle.Font = Enum.Font.GothamBold
+
+logScroll = Instance.new("ScrollingFrame")
+logScroll.BackgroundTransparency = 1
+logScroll.BorderSizePixel = 0
+logScroll.Position = UDim2.fromOffset(6, 24)
+logScroll.Size = UDim2.new(1, -12, 1, -28)
+logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+logScroll.ScrollBarThickness = 5
+logScroll.ScrollBarImageColor3 = THEME.Accent
+logScroll.Parent = logFrame
+
+logLabel = Instance.new("TextLabel")
+logLabel.BackgroundTransparency = 1
+logLabel.Text = ""
+logLabel.TextColor3 = THEME.Text
+logLabel.TextSize = 11
+logLabel.Font = Enum.Font.Code
+logLabel.TextXAlignment = Enum.TextXAlignment.Left
+logLabel.TextYAlignment = Enum.TextYAlignment.Top
+logLabel.TextWrapped = true
+logLabel.AutomaticSize = Enum.AutomaticSize.Y
+logLabel.Size = UDim2.new(1, -8, 0, 0)
+logLabel.Position = UDim2.fromOffset(0, 0)
+logLabel.Parent = logScroll
+
+local features = {}
+local featureOrder = {}
+
+updateSummary = function()
+    local running = 0
+    for _, id in ipairs(featureOrder) do
+        local f = features[id]
+        if f and f.running then
+            running = running + 1
+        end
+    end
+    if summaryStatus then
+        summaryStatus.Text = string.format("%d feature(s) running. Log lines: %d. Client-side only.", running, #logLines)
+    end
+end
+
+local function setFeatureStatus(id, text)
+    local f = features[id]
+    if f and f.statusLabel then
+        f.statusLabel.Text = tostring(text)
+    end
+end
+
+local function refreshFeature(f)
+    if not f then
+        return
+    end
+    f.btn.Text = f.running and "Stop" or "Start"
+    f.btn.BackgroundColor3 = f.running and Color3.fromRGB(90, 32, 52) or THEME.Button
+    if f.statusLabel then
+        f.statusLabel.TextColor3 = f.running and THEME.Green or THEME.Muted
+    end
+end
+
+local function setFeatureRunning(id, running, silent)
+    local f = features[id]
+    if not f or f.running == running then
+        return
+    end
+
+    f.running = running
+
+    if running then
+        if f.onStart then
+            local ok, err = pcall(f.onStart)
+            if not ok then
+                addLog("ERROR", f.name .. " start failed: " .. tostring(err))
+                f.running = false
+            end
+        end
+    else
+        if f.onStop then
+            pcall(f.onStop)
+        end
+    end
+
+    refreshFeature(f)
+    updateSummary()
+
+    if not silent then
+        addLog("FEATURE", f.name .. " " .. (f.running and "started" or "stopped"))
+    end
+end
+
+local function addFeature(id, name, desc, onStart, onStop, onTick, extraText, extraCallback)
+    local row = Instance.new("Frame")
+    row.Name = id
+    row.Size = UDim2.new(1, -4, 0, 60)
+    row.BackgroundColor3 = THEME.Panel
+    row.BorderSizePixel = 0
+    row.Parent = featureScroll
+    corner(row, 8)
+    stroke(row, THEME.Border, 1)
+
+    local titleLabel = label(row, name, UDim2.new(1, -150, 0, 18), UDim2.fromOffset(10, 5), 13, THEME.Text)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local descLabel = label(row, desc, UDim2.new(1, -150, 0, 16), UDim2.fromOffset(10, 23), 10, THEME.Muted)
+    descLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local statusLabel = label(row, "Stopped", UDim2.new(0, 130, 0, 14), UDim2.fromOffset(10, 42), 10, THEME.Muted)
+    statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local btn = button(row, "Start", UDim2.fromOffset(64, 28), UDim2.new(1, -74, 0, 5))
+
+    local extraBtn
+    if extraText then
+        extraBtn = button(row, extraText, UDim2.fromOffset(64, 22), UDim2.new(1, -74, 0, 35))
+        extraBtn.TextSize = 10
+        extraBtn.MouseButton1Click:Connect(function()
+            if extraCallback then
+                local ok, err = pcall(extraCallback)
+                if not ok then
+                    addLog("ERROR", name .. " action failed: " .. tostring(err))
+                end
+            end
+        end)
+    end
+
+    local f = {
+        id = id,
+        name = name,
+        running = false,
+        onStart = onStart,
+        onStop = onStop,
+        onTick = onTick,
+        btn = btn,
+        statusLabel = statusLabel,
+        row = row,
+    }
+
+    features[id] = f
+    table.insert(featureOrder, id)
+
+    btn.MouseButton1Click:Connect(function()
+        setFeatureRunning(id, not f.running)
+    end)
+
+    featureScroll.CanvasSize = UDim2.new(0, 0, 0, #featureOrder * 66 + 8)
+    return f
+end
+
+-- =========================================================
+-- Utility remote lookups
+-- =========================================================
+
+local function getNet()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    if not modules then
+        return nil
+    end
+    return modules:FindFirstChild("Net")
+end
+
+local function findRemotePath(root, path)
+    local cur = root
+    for _, name in ipairs(path) do
+        if not cur then
+            return nil
+        end
+        cur = cur:FindFirstChild(name)
+    end
+    return cur
+end
+
+local function getGachaRF()
+    local net = getNet()
+    return net and net:FindFirstChild("RF/GachaNetworkRF")
+end
+
+-- =========================================================
+-- Pumpkin tracker
+-- =========================================================
+
+local pumpkinSeen = {}
+local pumpkinLastCount = 0
+local respawnEndsAt = nil
+local respawnNotified = true
+
+local function scanPumpkins()
+    local list = {}
+    local hunt = Workspace:FindFirstChild("PumpkinHunt")
+    if hunt then
+        for _, d in ipairs(hunt:GetDescendants()) do
+            if d:IsA("Model") and d.Name:lower():find("pumpkin", 1, true) then
+                table.insert(list, d)
+            end
+        end
+    end
+    return list
+end
+
+local function pumpkinStart()
+    pumpkinSeen = {}
+    pumpkinLastCount = 0
+    addLog("PUMPKIN", "Pumpkin tracker started. Watching workspace.PumpkinHunt.")
+end
+
+local function pumpkinTick()
+    local list = scanPumpkins()
+    local now = {}
+    for _, obj in ipairs(list) do
+        now[obj] = true
+        if not pumpkinSeen[obj] then
+            addLog("PUMPKIN", "Detected " .. obj:GetFullName())
+        end
+    end
+
+    for obj in pairs(pumpkinSeen) do
+        if not now[obj] then
+            addLog("PUMPKIN", "No longer visible: " .. tostring(obj.Name))
+        end
+    end
+
+    local oldCount = pumpkinLastCount
+    pumpkinSeen = now
+    pumpkinLastCount = #list
+
+    setFeatureStatus("pumpkin", tostring(#list) .. " pumpkin model(s) visible")
+
+    if #list < oldCount then
+        respawnEndsAt = os.clock() + CONFIG.OBSERVED_PUMPKIN_RESPAWN
+        respawnNotified = false
+        addLog("RESPAWN", "Pumpkin disappeared. Local estimate timer set to 690s (observed, not server-confirmed).")
+    end
+end
+
+-- =========================================================
+-- Material scanner
+-- =========================================================
+
+local MATERIAL_KEYWORDS = { "candy", "corn", "pumpkin", "bit", "seed", "treat", "halloween", "spooky", "soul", "bone" }
+
+local function hasMaterialKeyword(name)
+    local s = tostring(name):lower()
+    for _, k in ipairs(MATERIAL_KEYWORDS) do
+        if s:find(k, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function collectMaterials()
+    local out = {}
+
+    local function add(name, value)
+        if hasMaterialKeyword(name) and type(value) == "number" then
+            out[name] = value
+        end
+    end
+
+    for k, v in pairs(player:GetAttributes()) do
+        add("attr." .. tostring(k), v)
+    end
+
+    local leaderstats = player:FindFirstChild("leaderstats")
+    if leaderstats then
+        for _, c in ipairs(leaderstats:GetChildren()) do
+            if c:IsA("ValueBase") then
+                add("leaderstats." .. c.Name, c.Value)
+            end
+        end
+    end
+
+    local containers = { player:FindFirstChild("Backpack"), player.Character }
+    for _, cont in ipairs(containers) do
+        if cont then
+            for _, child in ipairs(cont:GetChildren()) do
+                if child:IsA("Tool") and hasMaterialKeyword(child.Name) then
+                    local key = "tool." .. child.Name
+                    out[key] = (out[key] or 0) + 1
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+local function materialString(tbl)
+    local keys = {}
+    for k in pairs(tbl) do
+        table.insert(keys, k)
+    end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+        table.insert(parts, tostring(k) .. "=" .. tostring(tbl[k]))
+    end
+    return table.concat(parts, ", ")
+end
+
+local materialSnapshot = nil
+
+local function materialStart()
+    materialSnapshot = nil
+    addLog("MATERIAL", "Material scanner started. Reading only client-visible attributes, leaderstats, and tools.")
+end
+
+local function materialTick()
+    local snap = collectMaterials()
+    local str = materialString(snap)
+
+    if not materialSnapshot then
+        addLog("MATERIAL", "Initial readable materials: " .. (str ~= "" and str or "none"))
+        materialSnapshot = snap
+    elseif materialString(materialSnapshot) ~= str then
+        addLog("MATERIAL", "Material changes: " .. (str ~= "" and str or "none"))
+        materialSnapshot = snap
+    end
+
+    local count = 0
+    for _ in pairs(snap) do
+        count = count + 1
+    end
+    setFeatureStatus("materials", tostring(count) .. " readable value(s)")
+end
+
+-- =========================================================
+-- Event keyword observer
+-- =========================================================
+
+local EVENT_KEYWORDS = { "trick", "treat", "dapper", "cursed", "seed", "spooky", "jack", "pumpkin", "halloween" }
+local eventLast = {}
+
+local function scanEventObjects()
+    local roots = {}
+    local function addRoot(name)
+        local r = Workspace:FindFirstChild(name)
+        if r then
+            table.insert(roots, r)
+        end
+    end
+
+    addRoot("PumpkinHunt")
+    addRoot("NPCs")
+    addRoot("Halloween")
+
+    if #roots == 0 then
+        table.insert(roots, Workspace)
+    end
+
+    local found = {}
+    for _, root in ipairs(roots) do
+        local ok, descendants = pcall(function()
+            return root:GetDescendants()
+        end)
+        if ok then
+            for _, d in ipairs(descendants) do
+                local n = d.Name:lower()
+                for _, k in ipairs(EVENT_KEYWORDS) do
+                    if n:find(k, 1, true) then
+                        found[d] = d.ClassName .. ":" .. d.Name
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function eventStart()
+    eventLast = {}
+    addLog("EVENT", "Event keyword observer started. Best-effort local name scan only.")
+end
+
+local function eventTick()
+    local found = scanEventObjects()
+
+    for obj, desc in pairs(found) do
+        if not eventLast[obj] then
+            addLog("EVENT", "Detected " .. desc)
+        end
+    end
+
+    for obj, desc in pairs(eventLast) do
+        if not found[obj] then
+            addLog("EVENT", "No longer visible " .. desc)
+        end
+    end
+
+    eventLast = found
+
+    local count = 0
+    for _ in pairs(found) do
+        count = count + 1
+    end
+    setFeatureStatus("events", tostring(count) .. " keyword object(s)")
+end
+
+-- =========================================================
+-- Gacha monitor and manual probe
+-- =========================================================
+
+local gachaLastPresent = nil
+
+local function invokeGachaContext(context)
+    local rf = getGachaRF()
+    if not rf then
+        addLog("GACHA", "RF/GachaNetworkRF is missing. Cannot call " .. tostring(context))
+        return false
+    end
+
+    local payload = {
+        Context = context,
+        BoxName = CONFIG.GACHA_BOX,
+    }
+
+    local ok, res = pcall(function()
+        if rf:IsA("RemoteFunction") then
+            return rf:InvokeServer(payload)
+        elseif rf:IsA("RemoteEvent") then
+            rf:FireServer(payload)
+            return "fired"
+        else
+            error("Unsupported remote class: " .. rf.ClassName)
+        end
+    end)
+
+    if ok then
+        addLog("GACHA", tostring(context) .. " -> " .. fmt(res))
+        return true, res
+    else
+        addLog("ERROR", "Gacha " .. tostring(context) .. " failed: " .. tostring(res))
+        return false
+    end
+end
+
+local function probeGacha()
+    addLog("GACHA", "Probing Halloween26Gacha with GetPityData and Check. No purchase is made.")
+    invokeGachaContext("GetPityData")
+    task.wait(0.3)
+    invokeGachaContext("Check")
+end
+
+local function gachaStart()
+    gachaLastPresent = nil
+    addLog("GACHA", "Halloween Gacha monitor started. It only checks remote presence and manual probes.")
+end
+
+local function gachaTick()
+    local present = getGachaRF() ~= nil
+    if present ~= gachaLastPresent then
+        gachaLastPresent = present
+        addLog("GACHA", present and "RF/GachaNetworkRF is present." or "RF/GachaNetworkRF is missing.")
+    end
+    setFeatureStatus("gacha", present and "remote present" or "remote missing")
+end
+
+local purchaseConfirmUntil = 0
+
+local function requestGachaPurchase()
+    if os.clock() < purchaseConfirmUntil then
+        purchaseConfirmUntil = 0
+        addLog("GACHA", "Manual Purchase requested. The server will validate Candy Corn and arguments.")
+        invokeGachaContext("Purchase")
+    else
+        purchaseConfirmUntil = os.clock() + 5
+        addLog("WARN", "Gacha purchase confirmation: tap Buy Gacha again within 5 seconds. This may spend 500 Candy Corn if the server accepts it.")
+    end
+end
+
+-- =========================================================
+-- Fruit inventory observer
+-- =========================================================
+
+local fruitLastString = nil
+
+local function collectFruits()
+    local out = {}
+    local containers = { player:FindFirstChild("Backpack"), player.Character }
+    for _, cont in ipairs(containers) do
+        if cont then
+            for _, child in ipairs(cont:GetChildren()) do
+                if child:IsA("Tool") then
+                    table.insert(out, child.Name)
+                end
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function fruitStart()
+    fruitLastString = nil
+    addLog("FRUIT", "Fruit inventory observer started. Listing tool names only.")
+end
+
+local function fruitTick()
+    local list = collectFruits()
+    local str = table.concat(list, ", ")
+    if fruitLastString ~= str then
+        addLog("FRUIT", "Tools: " .. (str ~= "" and str or "none"))
+        fruitLastString = str
+    end
+    setFeatureStatus("fruits", tostring(#list) .. " tool(s)")
+end
+
+-- =========================================================
+-- Respawn countdown
+-- =========================================================
+
+local function respawnStart()
+    addLog("RESPAWN", "Respawn countdown started. It uses the observed 690s estimate, not a verified server timer.")
+end
+
+local function respawnTick()
+    if respawnEndsAt then
+        local remain = respawnEndsAt - os.clock()
+        if remain > 0 then
+            setFeatureStatus("respawn", string.format("Est. %02d:%02d", math.floor(remain / 60), math.floor(remain % 60)))
+        else
+            if not respawnNotified then
+                addLog("RESPAWN", "Local 690s estimate reached. Verify actual respawn in game.")
+                respawnNotified = true
+            end
+            setFeatureStatus("respawn", "Estimate reached")
+            respawnEndsAt = nil
+        end
+    else
+        setFeatureStatus("respawn", "waiting for pumpkin removal")
+    end
+end
+
+-- =========================================================
+-- Remote diagnostics
+-- =========================================================
+
+local DIAG_PATHS = {
+    { "Remotes", "OnTalkToNPC" },
+    { "Modules", "Net", "RF/GachaNetworkRF" },
+    { "Modules", "Net", "RF/SceneNetwork" },
+    { "Remotes", "CommF_" },
+    { "Modules", "Net", "RE/RegisterHit" },
+    { "Modules", "Net", "RE/RegisterAttack" },
+}
+
+local diagLast = 0
+
+local function runDiagnostics(verbose)
+    local present = 0
+    for _, path in ipairs(DIAG_PATHS) do
+        local obj = findRemotePath(ReplicatedStorage, path)
+        local name = table.concat(path, ".")
+        if obj then
+            present = present + 1
+            if verbose then
+                addLog("DIAG", "FOUND " .. name .. " (" .. obj.ClassName .. ")")
+            end
+        else
+            if verbose then
+                addLog("DIAG", "MISSING " .. name)
+            end
+        end
+    end
+    setFeatureStatus("diag", tostring(present) .. "/" .. tostring(#DIAG_PATHS) .. " remotes present")
+end
+
+local function diagStart()
+    diagLast = 0
+    addLog("DIAG", "Remote diagnostics started. Checking only captured remote paths.")
+    runDiagnostics(true)
+end
+
+local function diagTick()
+    if os.clock() - diagLast < 15 then
+        return
+    end
+    diagLast = os.clock()
+    runDiagnostics(false)
+end
+
+-- =========================================================
+-- Register features
+-- =========================================================
+
+addFeature(
+    "pumpkin",
+    "Pumpkin Tracker",
+    "Watches workspace.PumpkinHunt and logs visible pumpkin models.",
+    pumpkinStart,
+    nil,
+    pumpkinTick
+)
+
+addFeature(
+    "materials",
+    "Material Scanner",
+    "Reads only local attributes, leaderstats, and tools with material keywords.",
+    materialStart,
+    nil,
+    materialTick
+)
+
+addFeature(
+    "events",
+    "Event Keyword Observer",
+    "Best-effort local scan for Trick-or-Treat, Dapper Jack, Cursed Seed, etc.",
+    eventStart,
+    nil,
+    eventTick
+)
+
+addFeature(
+    "gacha",
+    "Halloween Gacha Monitor",
+    "Checks remote presence. Use Check for GetPityData/Check. No fake rolls.",
+    gachaStart,
+    nil,
+    gachaTick,
+    "Check",
+    probeGacha
+)
+
+addFeature(
+    "fruits",
+    "Fruit Inventory Observer",
+    "Lists tool names in Backpack and Character. Does not store fruits.",
+    fruitStart,
+    nil,
+    fruitTick
+)
+
+addFeature(
+    "respawn",
+    "Respawn Countdown",
+    "Local 690s estimate after a pumpkin disappears. Not server-confirmed.",
+    respawnStart,
+    nil,
+    respawnTick
+)
+
+addFeature(
+    "diag",
+    "Remote Diagnostics",
+    "Reports which captured remote paths actually exist in this game.",
+    diagStart,
+    nil,
+    diagTick
+)
+
+-- =========================================================
+-- Main feature loop
+-- =========================================================
+
+task.spawn(function()
+    while screenGui.Parent do
+        for _, id in ipairs(featureOrder) do
+            local f = features[id]
+            if f and f.running and f.onTick then
+                local ok, err = pcall(f.onTick)
+                if not ok then
+                    addLog("ERROR", f.name .. " tick failed: " .. tostring(err))
+                    setFeatureStatus(id, "error")
+                end
+            end
+        end
+        task.wait(CONFIG.FEATURE_TICK)
+    end
+end)
+
+-- =========================================================
+-- UI actions
+-- =========================================================
+
+startAllBtn.MouseButton1Click:Connect(function()
+    addLog("FEATURE", "Start All requested.")
+    for _, id in ipairs(featureOrder) do
+        setFeatureRunning(id, true, true)
+    end
+    updateSummary()
+end)
+
+stopAllBtn.MouseButton1Click:Connect(function()
+    addLog("FEATURE", "Stop All requested.")
+    for _, id in ipairs(featureOrder) do
+        setFeatureRunning(id, false, true)
+    end
+    updateSummary()
+end)
+
+loggingBtn.MouseButton1Click:Connect(function()
+    logEnabled = not logEnabled
+    loggingBtn.Text = "Logging: " .. (logEnabled and "ON" or "OFF")
+    if logEnabled then
+        addLog("SYS", "Logging enabled.")
+    end
+end)
+
+clearBtn.MouseButton1Click:Connect(function()
+    logLines = {}
+    if logLabel then
+        logLabel.Text = ""
+    end
+    if logScroll then
+        logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    end
+    updateSummary()
+end)
+
+copyBtn.MouseButton1Click:Connect(function()
+    local ok, err = pcall(function()
+        setclipboard(table.concat(logLines, "\n"))
+    end)
+    if ok then
+        addLog("SYS", "Logs copied to clipboard.")
+    else
+        addLog("ERROR", "Copy failed: " .. tostring(err))
+    end
+end)
+
+buyGachaBtn.MouseButton1Click:Connect(requestGachaPurchase)
+
+local minimized = false
+local savedSize = main.Size
+
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized then
+        savedSize = main.Size
+        main.Size = UDim2.new(savedSize.X.Scale, savedSize.X.Offset, 0, headerH)
+        content.Visible = false
+        minBtn.Text = "□"
+    else
+        main.Size = savedSize
+        content.Visible = true
+        minBtn.Text = "—"
+    end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    screenGui:Destroy()
+end)
+
+-- Dragging
 local dragging = false
-local dragStart
-local startPos
+local dragStart = nil
+local startPos = nil
 
 header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPos = main.Position
@@ -85,10 +999,7 @@ header.InputBegan:Connect(function(input)
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-    if dragging and (
-        input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch
-    ) then
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
         local delta = input.Position - dragStart
         main.Position = UDim2.new(
             startPos.X.Scale,
@@ -100,544 +1011,11 @@ UserInputService.InputChanged:Connect(function(input)
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = false
     end
 end)
 
-local function makeLabel(text, y)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, -20, 0, 23)
-    l.Position = UDim2.fromOffset(10, y)
-    l.BackgroundTransparency = 1
-    l.Text = text
-    l.TextColor3 = Color3.fromRGB(240, 235, 250)
-    l.Font = Enum.Font.GothamBold
-    l.TextSize = 13
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Parent = main
-    return l
-end
-
-local status = makeLabel("Status: Connecting...", 48)
-local candy = makeLabel("🍬 Candy Corn: 0", 76)
-local bits = makeLabel("🎃 Pumpkin Bits: 0 / 1000", 103)
-local defeated = makeLabel("Pumpkins defeated: 0", 130)
-local seeds = makeLabel("Cursed Seeds: 0", 157)
-local rolls = makeLabel("Gacha rolls: 0 / 2", 184)
-local cooldown = makeLabel("Next pumpkin: Ready", 211)
-
-local function makeButton(name, text, x, y, width)
-    local b = Instance.new("TextButton")
-    b.Name = name
-    b.Size = UDim2.fromOffset(width, 34)
-    b.Position = UDim2.fromOffset(x, y)
-    b.Text = text
-    b.BackgroundColor3 = Color3.fromRGB(95, 55, 155)
-    b.TextColor3 = Color3.new(1, 1, 1)
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 12
-    b.Parent = main
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-    return b
-end
-
-local start = makeButton("Start", "START", 10, 246, 93)
-local pause = makeButton("Pause", "PAUSE", 113, 246, 93)
-local stop = makeButton("Stop", "STOP", 216, 246, 93)
-
-local roll = makeButton("Roll", "ROLL - 500", 10, 288, 145)
-local store = makeButton("Store", "STORE FRUIT", 165, 288, 144)
-
-local inventory = makeLabel("Fruits: None", 330)
-local stored = makeLabel("Stored: None", 355)
-
-local logFrame = Instance.new("ScrollingFrame")
-logFrame.Position = UDim2.fromOffset(10, 383)
-logFrame.Size = UDim2.new(1, -20, 0, 28)
-logFrame.BackgroundColor3 = Color3.fromRGB(32, 29, 43)
-logFrame.BorderSizePixel = 0
-logFrame.ScrollBarThickness = 3
-logFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
-logFrame.CanvasSize = UDim2.new()
-logFrame.Parent = main
-
-local logLayout = Instance.new("UIListLayout")
-logLayout.Parent = logFrame
-logLayout.Padding = UDim.new(0, 2)
-
-local latestFruit
-
-local function addLog(message)
-    if not message or message == "" then return end
-
-    local line = Instance.new("TextLabel")
-    line.Size = UDim2.new(1, -6, 0, 18)
-    line.BackgroundTransparency = 1
-    line.TextColor3 = Color3.fromRGB(205, 195, 220)
-    line.TextXAlignment = Enum.TextXAlignment.Left
-    line.Font = Enum.Font.Gotham
-    line.TextSize = 10
-    line.Text = os.date("%H:%M:%S") .. " | " .. message
-    line.Parent = logFrame
-end
-
-local nextPumpkinTime = 0
-
-local function display(d)
-    status.Text = "Status: " .. tostring(d.Status)
-    candy.Text = "🍬 Candy Corn: " .. tostring(d.Candy)
-    bits.Text = "🎃 Pumpkin Bits: " .. tostring(d.Bits) .. " / 1000"
-    defeated.Text = "Pumpkins defeated: " .. tostring(d.Defeated)
-    seeds.Text = "Cursed Seeds: " .. tostring(d.Seeds)
-    rolls.Text = "Gacha rolls: " .. tostring(d.Rolls) .. " / 2"
-
-    local fruits = d.Fruits or {}
-    local storedFruits = d.Stored or {}
-
-    latestFruit = fruits[#fruits]
-
-    inventory.Text = "Fruits: "
-        .. (#fruits > 0 and table.concat(fruits, ", ") or "None")
-
-    stored.Text = "Stored: "
-        .. (#storedFruits > 0
-            and table.concat(storedFruits, ", ")
-            or "None")
-
-    nextPumpkinTime = d.NextPumpkin or 0
-
-    addLog(d.Message)
-end
-
-RunService.Heartbeat:Connect(function()
-    if nextPumpkinTime > os.time() then
-        cooldown.Text = "Next pumpkin: "
-            .. tostring(nextPumpkinTime - os.time()) .. "s"
-    else
-        cooldown.Text = "Next pumpkin: Ready"
-    end
-end)
-
-Update.OnClientEvent:Connect(display)
-
-start.Activated:Connect(function()
-    Action:FireServer("Start")
-end)
-
-pause.Activated:Connect(function()
-    Action:FireServer("Pause")
-end)
-
-stop.Activated:Connect(function()
-    Action:FireServer("Stop")
-end)
-
-roll.Activated:Connect(function()
-    Action:FireServer("Roll")
-end)
-
-store.Activated:Connect(function()
-    if latestFruit then
-        Action:FireServer("Store", latestFruit)
-    else
-        addLog("No fruit available.")
-    end
-end)
-
-close.Activated:Connect(function()
-    Action:FireServer("Stop")
-    gui:Destroy()
-end)
-
-local success, initial = pcall(function()
-    return GetState:InvokeServer()
-end)
-
-if success then
-    display(initial)
-    addLog("Elites Halloween Farm V3 connected.")
-else
-    status.Text = "Status: Server connection failed"
-    addLog("Check HalloweenFarmServer in ServerScriptService.")
-end
-
--- ELITES HALLOWEEN FARM V3
--- Place in ServerScriptService
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local CONFIG = {
-    PUMPKIN_HEALTH = 100,
-    PUMPKIN_DAMAGE = 25,
-    PUMPKIN_CANDY = 100,
-    PUMPKIN_BITS = 10,
-
-    SPECIAL_HEALTH = 250,
-    SPECIAL_CANDY = 250,
-    SPECIAL_BITS = 25,
-
-    PUMPKIN_RESPAWN = 690,
-
-    GACHA_COST = 500,
-    ROLLS_PER_HOUR = 2,
-    ROLL_WINDOW = 3600,
-
-    FARM_INTERVAL = 0.4,
-}
-
-local random = Random.new()
-local data = {}
-local loops = {}
-
--- Remote setup
-local folder = ReplicatedStorage:FindFirstChild("HalloweenFarmRemotes")
-if not folder then
-    folder = Instance.new("Folder")
-    folder.Name = "HalloweenFarmRemotes"
-    folder.Parent = ReplicatedStorage
-end
-
-local function remote(className, name)
-    local obj = folder:FindFirstChild(name)
-    if not obj then
-        obj = Instance.new(className)
-        obj.Name = name
-        obj.Parent = folder
-    end
-    return obj
-end
-
-local Action = remote("RemoteEvent", "Action")
-local Update = remote("RemoteEvent", "Update")
-local GetState = remote("RemoteFunction", "GetState")
-
-local enemies = workspace:FindFirstChild("HalloweenEnemies")
-if not enemies then
-    enemies = Instance.new("Folder")
-    enemies.Name = "HalloweenEnemies"
-    enemies.Parent = workspace
-end
-
-local fruitPool = {
-    "Rocket", "Spin", "Chop", "Spring", "Bomb",
-    "Smoke", "Spike", "Flame", "Sand", "Ice",
-    "Dark", "Light", "Magma", "Buddha", "Portal",
-}
-
-local function getData(player)
-    if not data[player] then
-        data[player] = {
-            Candy = 0,
-            Bits = 0,
-            Defeated = 0,
-            Seeds = 0,
-            Fruits = {},
-            Stored = {},
-            RollTimes = {},
-            Running = false,
-            Paused = false,
-            Status = "Stopped",
-            NextPumpkin = 0,
-            Generation = 0,
-        }
-    end
-    return data[player]
-end
-
-local function update(player, message)
-    local d = getData(player)
-
-    Update:FireClient(player, {
-        Candy = d.Candy,
-        Bits = d.Bits,
-        Defeated = d.Defeated,
-        Seeds = d.Seeds,
-        Fruits = d.Fruits,
-        Stored = d.Stored,
-        Rolls = #d.RollTimes,
-        Status = d.Status,
-        NextPumpkin = d.NextPumpkin,
-        Message = message or "",
-    })
-end
-
-local function reward(player, candy, bits)
-    local d = getData(player)
-    d.Candy += candy
-    d.Bits = math.min(1000, d.Bits + bits)
-end
-
-local function removeEnemies(player)
-    for _, enemy in ipairs(enemies:GetChildren()) do
-        if enemy:GetAttribute("Owner") == player.UserId then
-            enemy:Destroy()
-        end
-    end
-end
-
-local function spawnEnemy(player, special)
-    local character = player.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    local origin = root and root.Position or Vector3.new(0, 5, 0)
-
-    local enemy = Instance.new("Part")
-    enemy.Name = special and "Jack-o-lantern" or "Pumpkin"
-    enemy.Shape = Enum.PartType.Ball
-    enemy.Anchored = true
-    enemy.CanCollide = false
-    enemy.Material = Enum.Material.Neon
-    enemy.Color = special
-        and Color3.fromRGB(255, 65, 15)
-        or Color3.fromRGB(255, 145, 20)
-
-    enemy.Size = special
-        and Vector3.new(7, 7, 7)
-        or Vector3.new(5, 5, 5)
-
-    enemy.Position = origin + Vector3.new(
-        random:NextInteger(-15, 15),
-        3,
-        random:NextInteger(-15, 15)
-    )
-
-    enemy:SetAttribute("Owner", player.UserId)
-    enemy:SetAttribute(
-        "Health",
-        special and CONFIG.SPECIAL_HEALTH or CONFIG.PUMPKIN_HEALTH
-    )
-
-    enemy.Parent = enemies
-
-    local billboard = Instance.new("BillboardGui")
-    billboard.Size = UDim2.fromOffset(170, 35)
-    billboard.StudsOffset = Vector3.new(0, 4, 0)
-    billboard.AlwaysOnTop = true
-    billboard.Parent = enemy
-
-    local text = Instance.new("TextLabel")
-    text.Size = UDim2.fromScale(1, 1)
-    text.BackgroundTransparency = 1
-    text.TextColor3 = Color3.new(1, 1, 1)
-    text.TextStrokeTransparency = 0
-    text.Font = Enum.Font.GothamBold
-    text.TextScaled = true
-    text.Parent = billboard
-
-    local function refresh()
-        text.Text = enemy.Name .. " | HP: "
-            .. tostring(enemy:GetAttribute("Health"))
-    end
-
-    refresh()
-    return enemy, refresh
-end
-
-local function waitUntilActive(player, generation)
-    local d = getData(player)
-
-    while player.Parent
-        and d.Running
-        and d.Generation == generation
-        and d.Paused do
-        task.wait(0.2)
-    end
-
-    return player.Parent
-        and d.Running
-        and d.Generation == generation
-end
-
-local function fight(player, enemy, refresh, generation)
-    local d = getData(player)
-
-    while enemy.Parent and d.Running
-        and d.Generation == generation do
-
-        if not waitUntilActive(player, generation) then
-            break
-        end
-
-        local health = enemy:GetAttribute("Health") or 0
-        health -= CONFIG.PUMPKIN_DAMAGE
-        enemy:SetAttribute("Health", math.max(0, health))
-        refresh()
-
-        if health <= 0 then
-            enemy:Destroy()
-            return true
-        end
-
-        task.wait(CONFIG.FARM_INTERVAL)
-    end
-
-    return false
-end
-
-local function fightSpecial(player, generation)
-    local d = getData(player)
-    local enemy, refresh = spawnEnemy(player, true)
-
-    update(player, "Jack-o-lantern appeared!")
-
-    if fight(player, enemy, refresh, generation) then
-        reward(player, CONFIG.SPECIAL_CANDY, CONFIG.SPECIAL_BITS)
-        d.Seeds += 1
-        update(player, "Jack-o-lantern defeated! +1 Cursed Seed.")
-    end
-end
-
-local function farm(player, generation)
-    local d = getData(player)
-
-    while player.Parent and d.Running
-        and d.Generation == generation do
-
-        if not waitUntilActive(player, generation) then
-            break
-        end
-
-        local remaining = d.NextPumpkin - os.time()
-
-        if remaining > 0 then
-            update(player, "Pumpkin respawning: " .. remaining .. " seconds")
-            task.wait(1)
-        else
-            local enemy, refresh = spawnEnemy(player, false)
-            update(player, "Pumpkin found! Attacking...")
-
-            if fight(player, enemy, refresh, generation) then
-                d.Defeated += 1
-                reward(player, CONFIG.PUMPKIN_CANDY, CONFIG.PUMPKIN_BITS)
-
-                d.NextPumpkin = os.time() + CONFIG.PUMPKIN_RESPAWN
-
-                update(player, "Pumpkin defeated! Rewards collected.")
-
-                if d.Defeated % 3 == 0 then
-                    fightSpecial(player, generation)
-                end
-            else
-                if enemy.Parent then
-                    enemy:Destroy()
-                end
-            end
-        end
-    end
-end
-
-local function cleanRolls(d)
-    local now = os.time()
-
-    for i = #d.RollTimes, 1, -1 do
-        if now - d.RollTimes[i] >= CONFIG.ROLL_WINDOW then
-            table.remove(d.RollTimes, i)
-        end
-    end
-end
-
-local function roll(player)
-    local d = getData(player)
-    cleanRolls(d)
-
-    if #d.RollTimes >= CONFIG.ROLLS_PER_HOUR then
-        update(player, "Two-roll hourly limit reached.")
-        return
-    end
-
-    if d.Candy < CONFIG.GACHA_COST then
-        update(player, "Not enough Candy Corn.")
-        return
-    end
-
-    d.Candy -= CONFIG.GACHA_COST
-    table.insert(d.RollTimes, os.time())
-
-    local fruit = fruitPool[random:NextInteger(1, #fruitPool)]
-    table.insert(d.Fruits, fruit)
-
-    update(player, "Gacha result: " .. fruit .. " Fruit!")
-end
-
-local function store(player, fruit)
-    local d = getData(player)
-
-    if typeof(fruit) ~= "string" then return end
-
-    local index = table.find(d.Fruits, fruit)
-    if not index then
-        update(player, "Fruit not found in inventory.")
-        return
-    end
-
-    table.remove(d.Fruits, index)
-    table.insert(d.Stored, fruit)
-    update(player, "Stored " .. fruit .. " Fruit.")
-end
-
-Action.OnServerEvent:Connect(function(player, action, value)
-    local d = getData(player)
-
-    if action == "Start" then
-        if not d.Running then
-            d.Running = true
-            d.Paused = false
-            d.Status = "Farming"
-            d.Generation += 1
-
-            local generation = d.Generation
-            update(player, "Farm started!")
-
-            task.spawn(farm, player, generation)
-        elseif d.Paused then
-            d.Paused = false
-            d.Status = "Farming"
-            update(player, "Farm resumed.")
-        end
-
-    elseif action == "Pause" then
-        if d.Running then
-            d.Paused = true
-            d.Status = "Paused"
-            update(player, "Farm paused.")
-        end
-
-    elseif action == "Stop" then
-        d.Running = false
-        d.Paused = false
-        d.Status = "Stopped"
-        d.Generation += 1
-        removeEnemies(player)
-        update(player, "Farm stopped.")
-
-    elseif action == "Roll" then
-        roll(player)
-
-    elseif action == "Store" then
-        store(player, value)
-    end
-end)
-
-GetState.OnServerInvoke = function(player)
-    local d = getData(player)
-    return {
-        Candy = d.Candy,
-        Bits = d.Bits,
-        Defeated = d.Defeated,
-        Seeds = d.Seeds,
-        Fruits = d.Fruits,
-        Stored = d.Stored,
-        Rolls = #d.RollTimes,
-        Status = d.Status,
-        NextPumpkin = d.NextPumpkin,
-    }
-end
-
-Players.PlayerRemoving:Connect(function(player)
-    removeEnemies(player)
-    data[player] = nil
-end)
-
-print("Elites Halloween Farm V3 ready.")
+addLog("SYS", "ELITES HALLOWEEN FARM loaded. No fake remotes, enemies, rewards, or currencies were created.")
+addLog("SYS", "This is a client-side observer. The server still validates all real actions.")
+updateSummary()

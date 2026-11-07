@@ -1,10 +1,10 @@
 --!nocheck
--- ELITES HALLOWEEN FARM — v8.4
--- Fixes: force re-equip, fallback category chain, equip verification,
---        PlatformStand bypass, per-tick attack logging, Copy Farm State button.
--- Preserves all v8.3 features: auto gacha, smooth fly, collect delay, GUI.
+-- ELITES HALLOWEEN FARM — v8.5
+-- Fixes: no more Melee/Sword switching, M1 actually swings (tool:Activate),
+--        PlatformStand removed (it broke animations), WalkSpeed lock instead.
+-- Preserves: auto gacha, smooth fly, collect delay, all GUI, all features.
 
-print("[EHF] v8.4 starting...")
+print("[EHF] v8.5 starting...")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -71,7 +71,6 @@ local CONFIG = {
     NPC_SCAN_INTERVAL = 3,
     COLLECT_TIMEOUT = 1.0,
     ATTACK_HYSTERESIS = 5,
-    RE_EQUIP_INTERVAL = 1.0,
     ATTACK_LOG_INTERVAL = 1.0,
     ROLL_CC_MIN = 400,
     ROLL_CC_MAX = 600,
@@ -111,7 +110,8 @@ local pumpkinFarm = {
     attackStartedAt = nil, blacklist = {}, weaponEquippedFor = nil,
     lastDistLog = 0, lastSelectedDistance = nil, lastKillTime = nil,
     collectStartedAt = nil, collectCCBefore = nil,
-    lastEquipAttempt = 0, lastAttackLog = 0, equipStatus = "unknown",
+    lastAttackLog = 0, equipStatus = "unknown",
+    walkSpeedBefore = 16,
 }
 local noclipParts = {}
 
@@ -287,6 +287,14 @@ end
 player.CharacterAdded:Connect(function(c)
     local h = c:WaitForChild("Humanoid", 5)
     if h then bindHumanoid(h) end
+    if pumpkinFarm.running then
+        task.wait(0.5)
+        local h2 = c:FindFirstChildOfClass("Humanoid")
+        if h2 then
+            pumpkinFarm.walkSpeedBefore = h2.WalkSpeed
+            h2.WalkSpeed = 0
+        end
+    end
 end)
 
 local KNOWN_FRUITS = {
@@ -741,7 +749,7 @@ local function buildUI()
     header.ZIndex = 3
     local title = makeLabel(header, "ELITES HALLOWEEN FARM", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(12, 5), 15, THEME.Text, true)
     title.ZIndex = 4
-    local sub = makeLabel(header, "v8.4 · force equip · live diag", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
+    local sub = makeLabel(header, "v8.5 · real M1 · single mode", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(12, 24), 10, THEME.Muted, false)
     sub.ZIndex = 4
     minBtn = makeButton(header, "—", UDim2.fromOffset(26, 26), UDim2.new(1, -62, 0, 9))
     minBtn.ZIndex = 5
@@ -1062,7 +1070,7 @@ updateSummary = function()
         if f and f.running then running = running + 1 end
     end
     if summaryStatus then
-        summaryStatus.Text = string.format("%d running · %d lines · %d/s · %s · equip:%s", running, #logLines, pumpkinFarm.speed, pumpkinFarm.weaponCategory, pumpkinFarm.equipStatus)
+        summaryStatus.Text = string.format("%d running · %d lines · %d/s · %s · %s", running, #logLines, pumpkinFarm.speed, pumpkinFarm.weaponCategory, pumpkinFarm.equipStatus)
     end
 end
 local function setFeatureStatus(id, text)
@@ -1187,8 +1195,18 @@ local function isMeleeStyle(name)
 end
 local function looksLikeFruitTool(name) return tostring(name):find("%-") ~= nil end
 
+local function getToolCategory(tool)
+    if not tool then return "none" end
+    if isMeleeStyle(tool.Name) then return "Melee" end
+    if looksLikeFruitTool(tool.Name) then return "Fruit" end
+    local wt = tool:GetAttribute("WeaponType")
+    if wt == "Sword" then return "Sword" end
+    if wt == "Gun" then return "Gun" end
+    return "Other"
+end
+
 -- =========================================================
--- FIXED: equipWeaponOfCategory with fallback chain + verification
+-- v8.5: SYNCHRONOUS equip, single category only, no switching
 -- =========================================================
 local function equipOne(desiredCategory)
     local char = player.Character
@@ -1197,28 +1215,20 @@ local function equipOne(desiredCategory)
     if not hum then return nil end
     local bp = player:FindFirstChild("Backpack")
     if not bp then return nil end
+
+    -- If already equipped with the right category, keep it
+    local current = char:FindFirstChildOfClass("Tool")
+    if current and getToolCategory(current) == desiredCategory then
+        return current
+    end
+
+    -- Find and equip a tool of that category (no task.wait, no PlatformStand toggle)
     for _, tool in ipairs(bp:GetChildren()) do
-        if tool:IsA("Tool") then
-            local isM = isMeleeStyle(tool.Name)
-            local isF = looksLikeFruitTool(tool.Name)
-            local cat
-            if isM then cat = "Melee"
-            elseif isF then cat = "Fruit"
-            else
-                local wt = tool:GetAttribute("WeaponType")
-                if wt == "Sword" then cat = "Sword"
-                elseif wt == "Gun" then cat = "Gun"
-                else cat = "Other" end
-            end
-            if cat == desiredCategory then
-                -- v8.4: temporarily disable PlatformStand to ensure equip works
-                local wasStand = hum.PlatformStand
-                hum.PlatformStand = false
-                local eqOk, eqErr = pcall(function() hum:EquipTool(tool) end)
-                task.wait(0.02)
-                local equippedNow = char:FindFirstChildOfClass("Tool")
-                hum.PlatformStand = wasStand
-                if eqOk and equippedNow == tool then
+        if tool:IsA("Tool") and getToolCategory(tool) == desiredCategory then
+            local ok = pcall(function() hum:EquipTool(tool) end)
+            if ok then
+                local after = char:FindFirstChildOfClass("Tool")
+                if after == tool then
                     return tool
                 end
             end
@@ -1228,26 +1238,12 @@ local function equipOne(desiredCategory)
 end
 
 local function equipWeaponOfCategory(category)
-    -- Try desired category first
     local eq = equipOne(category)
     if eq then
         pumpkinFarm.equipStatus = "OK:" .. eq.Name
         return eq
     end
-    -- Fallback chain: only Melee and Sword (same M1 signature)
-    local fallbacks = { "Melee", "Sword" }
-    for _, cat in ipairs(fallbacks) do
-        if cat ~= category then
-            local f = equipOne(cat)
-            if f then
-                pumpkinFarm.equipStatus = "FALLBACK:" .. cat .. ":" .. f.Name
-                addLog("WEAPON", "Fallback equip: " .. f.Name .. " (category " .. cat .. ")")
-                return f
-            end
-        end
-    end
-    -- No Melee or Sword found — this account cannot farm
-    pumpkinFarm.equipStatus = "FAILED:NO_MELEE_OR_SWORD"
+    pumpkinFarm.equipStatus = "FAILED:NO_" .. string.upper(category)
     return nil
 end
 
@@ -1286,6 +1282,25 @@ local function fireRegisterHit(rootPart)
     return (pcall(function() r:FireServer(rootPart) end))
 end
 
+-- =========================================================
+-- v8.5: REAL M1 — tool:Activate() is what makes the swing happen
+-- =========================================================
+local function performM1Attack(targetRoot)
+    local char = player.Character
+    if not char then return false end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+    -- Primary: trigger the tool's own M1 (plays animation + fires internal register remotes + hitbox)
+    pcall(function() tool:Activate() end)
+    -- Backup: raw register remotes in case tool:Activate doesn't fire them internally
+    fireRegisterAttack()
+    if targetRoot then fireRegisterHit(targetRoot) end
+    return true
+end
+
+-- =========================================================
+-- RenderStepped — NO PlatformStand, always zero velocity
+-- =========================================================
 RunService.RenderStepped:Connect(function(dt)
     if not pumpkinFarm.running then return end
     local char = player.Character
@@ -1308,7 +1323,12 @@ RunService.RenderStepped:Connect(function(dt)
         pumpkinFarm.weaponEquippedFor = nil
         pumpkinFarm.collectStartedAt = nil
         pumpkinFarm.equipStatus = "unknown"
-        pcall(function() hum.PlatformStand = true end)
+        -- v8.5: WalkSpeed lock instead of PlatformStand
+        pcall(function()
+            pumpkinFarm.walkSpeedBefore = hum.WalkSpeed
+            hum.WalkSpeed = 0
+            hum.PlatformStand = false
+        end)
     end
     for _, part in ipairs(char:GetChildren()) do
         if part:IsA("BasePart") and part.CanCollide then
@@ -1316,14 +1336,15 @@ RunService.RenderStepped:Connect(function(dt)
             noclipParts[part] = true
         end
     end
+    -- v8.5: Always zero velocity so character doesn't fall while attacking
+    pcall(function()
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
     if pumpkinFarm.state == "MOVING" and not pumpkinFarm.flyTarget and pumpkinFarm.currentRoot and pumpkinFarm.currentRoot.Parent then
         pumpkinFarm.flyTarget = computeSafeFlyTarget(pumpkinFarm.currentRoot.Position)
     end
     if pumpkinFarm.flyTarget then
-        pcall(function()
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-        end)
         local offset = pumpkinFarm.flyTarget - hrp.Position
         local dist = offset.Magnitude
         if dist < 0.5 then pumpkinFarm.flyTarget = nil
@@ -1492,39 +1513,32 @@ local function pumpkinFarmTick()
             pumpkinFarm.state = "ATTACKING"
             pumpkinFarm.attackStartedAt = os.clock()
             pumpkinFarm.weaponEquippedFor = nil
-            pumpkinFarm.lastEquipAttempt = 0
         end
-        -- v8.4: force re-equip every RE_EQUIP_INTERVAL
-        local needReequip = pumpkinFarm.weaponEquippedFor ~= pumpkin
-        local periodicCheck = os.clock() - pumpkinFarm.lastEquipAttempt > CONFIG.RE_EQUIP_INTERVAL
-        if needReequip or periodicCheck then
-            pumpkinFarm.lastEquipAttempt = os.clock()
-            local beforeTool = char and char:FindFirstChildOfClass("Tool")
+        -- v8.5: Re-equip ONLY when current tool doesn't match category OR target changed
+        local currentTool = char:FindFirstChildOfClass("Tool")
+        local currentCat = currentTool and getToolCategory(currentTool) or "none"
+        local categoryWrong = currentCat ~= pumpkinFarm.weaponCategory
+        local targetChanged = pumpkinFarm.weaponEquippedFor ~= pumpkin
+        if categoryWrong or targetChanged then
             local eq = equipWeaponOfCategory(pumpkinFarm.weaponCategory)
-            local afterTool = char and char:FindFirstChildOfClass("Tool")
             pumpkinFarm.weaponEquippedFor = pumpkin
-            if eq and afterTool == eq then
+            if eq then
                 addLog("WEAPON", "Equipped: " .. eq.Name .. " (" .. pumpkinFarm.weaponCategory .. ")")
             else
-                addLog("WEAPON", "Equip verify: " .. pumpkinFarm.equipStatus .. " — before=" .. (beforeTool and beforeTool.Name or "nil") .. " after=" .. (afterTool and afterTool.Name or "nil"))
+                addLog("WEAPON", "FAILED — no " .. pumpkinFarm.weaponCategory .. " tool available")
             end
+            currentTool = char:FindFirstChildOfClass("Tool")
         end
-        local cur = char and char:FindFirstChildOfClass("Tool")
-        local equippedName = cur and cur.Name or "(none)"
+        local equippedName = currentTool and currentTool.Name or "(none)"
         setFeatureStatus("pumpkin", "attacking " .. pumpkin.Name .. " (" .. equippedName .. ")")
-        -- v8.4: log attack state every ATTACK_LOG_INTERVAL
         if os.clock() - pumpkinFarm.lastAttackLog > CONFIG.ATTACK_LOG_INTERVAL then
             pumpkinFarm.lastAttackLog = os.clock()
-            addLog("PUMPKIN", string.format("ATTACK TICK: target=%s equipped=%s dist=%.1f equipStatus=%s", tostring(pumpkin.Name), equippedName, dist, pumpkinFarm.equipStatus))
+            addLog("PUMPKIN", string.format("ATTACK: target=%s equipped=%s dist=%.1f status=%s", tostring(pumpkin.Name), equippedName, dist, pumpkinFarm.equipStatus))
         end
         pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(root.Position.X, hrp.Position.Y, root.Position.Z)) end)
         if os.clock() - pumpkinFarm.lastAttackTime >= CONFIG.ATTACK_COOLDOWN then
             pumpkinFarm.lastAttackTime = os.clock()
-            local aOk = fireRegisterAttack()
-            local hOk = fireRegisterHit(root)
-            if not aOk and not hOk then
-                addLog("PUMPKIN", "Attack remotes unavailable")
-            end
+            performM1Attack(root)
         end
         if pumpkinFarm.attackStartedAt and os.clock() - pumpkinFarm.attackStartedAt > CONFIG.ATTACK_TIMEOUT then
             blacklistTarget("timeout"); return
@@ -1546,12 +1560,21 @@ local function pumpkinFarmStart()
     pumpkinFarm.lastDistLog = 0
     pumpkinFarm.collectStartedAt = nil
     pumpkinFarm.collectCCBefore = nil
-    pumpkinFarm.lastEquipAttempt = 0
     pumpkinFarm.lastAttackLog = 0
     pumpkinFarm.equipStatus = "unknown"
     resetStuckTracking()
     noclipParts = {}
-    addLog("PUMPKIN", string.format("Started. %d/s, %s.", pumpkinFarm.speed, pumpkinFarm.weaponCategory))
+    -- v8.5: WalkSpeed = 0 instead of PlatformStand
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            pumpkinFarm.walkSpeedBefore = hum.WalkSpeed
+            hum.WalkSpeed = 0
+            hum.PlatformStand = false
+        end)
+    end
+    addLog("PUMPKIN", string.format("Started. %d/s, %s mode.", pumpkinFarm.speed, pumpkinFarm.weaponCategory))
     pumpkinFarm.thread = task.spawn(function()
         while pumpkinFarm.running do
             pcall(pumpkinFarmTick)
@@ -1577,7 +1600,12 @@ local function stopPumpkinFarm()
     noclipParts = {}
     local char = player.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if hum then pcall(function() hum.PlatformStand = false end) end
+    if hum then
+        pcall(function()
+            hum.WalkSpeed = pumpkinFarm.walkSpeedBefore or 16
+            hum.PlatformStand = false
+        end)
+    end
     pumpkinFarm.lastHumanoid = nil
     addLog("PUMPKIN", "Stopped.")
 end
@@ -1625,7 +1653,7 @@ local function trickOrTreatStart()
                 local hrp = char and char:FindFirstChild("HumanoidRootPart")
                 local hum = char and char:FindFirstChildOfClass("Humanoid")
                 if not hrp or not hum then setToTStatus("Error: no character"); task.wait(1); return end
-                if hum.PlatformStand then setToTStatus("Waiting: farm active"); task.wait(1); return end
+                if hum.WalkSpeed == 0 then setToTStatus("Waiting: farm active"); task.wait(1); return end
                 local doors = findTrickOrTreatDoors()
                 if #doors == 0 then setToTStatus("Searching (no doors)"); task.wait(2); return end
                 local best, bestDist = nil, math.huge
@@ -1861,7 +1889,7 @@ local function npcTick()
     setFeatureStatus("npc", tostring(n) .. " nearby")
 end
 
-addFeature("pumpkin", "Auto Pumpkin Farm", "Nearest + smooth fly + force equip + collect delay.", pumpkinFarmStart, stopPumpkinFarm, nil)
+addFeature("pumpkin", "Auto Pumpkin Farm", "Nearest + smooth fly + real M1 + single weapon mode.", pumpkinFarmStart, stopPumpkinFarm, nil)
 addFeature("treat", "Auto Trick or Treat", "Best-effort door search + interaction.", trickOrTreatStart, stopTrickOrTreat, nil)
 addFeature("events", "Event Keyword Observer", "Event-driven.", eventObserverStart, stopEventObserver, nil)
 addFeature("materials", "Material Scanner", "Attributes, leaderstats, tools.", matStart, nil, matTick)
@@ -1870,26 +1898,6 @@ addFeature("fruits", "Fruit Inventory Observer", "Tracks gacha rolls.", fruitSta
 addFeature("respawn", "Respawn Countdown", "690s local estimate.", respawnStart, nil, respawnTick)
 addFeature("npc", "NPC Threat Detection", "Diagnostic only.", npcStart, npcStop, npcTick)
 addFeature("diag", "Remote Diagnostics", "Captured remotes.", diagStart, nil, diagTick)
-
--- Publish global state for external inspection
-local function updateGlobalState()
-    local char = player.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local eq = char and char:FindFirstChildOfClass("Tool")
-    _G.EHF_STATE = {
-        state = pumpkinFarm.state,
-        currentPumpkin = pumpkinFarm.currentPumpkin and pumpkinFarm.currentPumpkin.Name or nil,
-        equipped = eq and eq.Name or nil,
-        weaponCategory = pumpkinFarm.weaponCategory,
-        equipStatus = pumpkinFarm.equipStatus,
-        health = hum and hum.Health or nil,
-        maxHealth = hum and hum.MaxHealth or nil,
-        platformStand = hum and hum.PlatformStand or nil,
-        speed = pumpkinFarm.speed,
-        pumpkinsFarmed = stats.pumpkinsFarmed,
-        timestamp = timestamp(),
-    }
-end
 
 task.spawn(function()
     while screenGui and screenGui.Parent do
@@ -1903,7 +1911,6 @@ task.spawn(function()
         pcall(function() checkCandyCornChange(); scanForNewFruits() end)
         pcall(function() detectManualRoll() end)
         pcall(function() updateCountdownLabels() end)
-        pcall(function() updateGlobalState() end)
         pcall(function() if activeTab == "stats" then refreshStatsTab() end end)
         task.wait(CONFIG.FEATURE_TICK)
     end
@@ -1935,11 +1942,29 @@ copyBtn.MouseButton1Click:Connect(function()
     if ok then addLog("SYS", "Copied.") end
 end)
 copyStateBtn.MouseButton1Click:Connect(function()
-    updateGlobalState()
-    local state = _G.EHF_STATE or {}
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local eq = char and char:FindFirstChildOfClass("Tool")
     local lines = {}
     table.insert(lines, "=== EHF STATE " .. timestamp() .. " ===")
-    for k, v in pairs(state) do table.insert(lines, k .. " = " .. tostring(v)) end
+    table.insert(lines, "Account: " .. player.Name)
+    table.insert(lines, "Farm state: " .. pumpkinFarm.state)
+    table.insert(lines, "Weapon category: " .. pumpkinFarm.weaponCategory)
+    table.insert(lines, "Equip status: " .. pumpkinFarm.equipStatus)
+    table.insert(lines, "Equipped: " .. (eq and eq.Name or "none"))
+    table.insert(lines, "HP: " .. (hum and (math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)) or "?"))
+    table.insert(lines, "WalkSpeed: " .. (hum and tostring(hum.WalkSpeed) or "?"))
+    table.insert(lines, "PlatformStand: " .. (hum and tostring(hum.PlatformStand) or "?"))
+    table.insert(lines, "Pumpkins farmed: " .. stats.pumpkinsFarmed)
+    table.insert(lines, "=== BACKPACK ===")
+    local bp = player:FindFirstChild("Backpack")
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") then
+                table.insert(lines, "  " .. t.Name .. " [cat=" .. getToolCategory(t) .. "]")
+            end
+        end
+    end
     table.insert(lines, "=== LOG TAIL ===")
     local start = math.max(1, #logLines - 60)
     for i = start, #logLines do table.insert(lines, logLines[i]) end
@@ -1948,7 +1973,7 @@ copyStateBtn.MouseButton1Click:Connect(function()
     if ok then
         addLog("SYS", "State copied (" .. #text .. " chars)")
         pcall(function()
-            StarterGui:SetCore("SendNotification", { Title = "EHF", Text = "State copied to clipboard", Duration = 5 })
+            StarterGui:SetCore("SendNotification", { Title = "EHF", Text = "State copied", Duration = 5 })
         end)
     else
         addLog("ERROR", "State copy failed")
@@ -2006,8 +2031,8 @@ pcall(checkCandyCornChange)
 pcall(seedExistingFruits)
 manualGachaState.lastCCObserved = readCandyCorn()
 refreshStatsTab()
-addLog("SYS", "v8.4 loaded. Force equip + fallback chain active.")
-addLog("SYS", "If farm attacks fail, click 'Copy State' and paste to me.")
+addLog("SYS", "v8.5 loaded. Real M1 via tool:Activate. No PlatformStand. Single weapon mode.")
+addLog("SYS", "Pick Melee or Sword. Farm will use ONLY that category.")
 if storeHookActive then addLog("SYS", "Store hook active.") end
 updateSummary()
-warn("[EHF] v8.4 GUI loaded successfully.")
+warn("[EHF] v8.5 GUI loaded successfully.")

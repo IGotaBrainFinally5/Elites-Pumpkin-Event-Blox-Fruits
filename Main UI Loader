@@ -1234,8 +1234,8 @@ local function equipWeaponOfCategory(category)
         pumpkinFarm.equipStatus = "OK:" .. eq.Name
         return eq
     end
-    -- Fallback chain
-    local fallbacks = { "Melee", "Sword", "Gun" }
+    -- Fallback chain: only Melee and Sword (same M1 signature)
+    local fallbacks = { "Melee", "Sword" }
     for _, cat in ipairs(fallbacks) do
         if cat ~= category then
             local f = equipOne(cat)
@@ -1246,7 +1246,8 @@ local function equipWeaponOfCategory(category)
             end
         end
     end
-    pumpkinFarm.equipStatus = "FAILED"
+    -- No Melee or Sword found — this account cannot farm
+    pumpkinFarm.equipStatus = "FAILED:NO_MELEE_OR_SWORD"
     return nil
 end
 
